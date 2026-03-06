@@ -45,8 +45,9 @@ app = FastAPI(
 
 # ALLOWED_ORIGINS: comma-separated list in env, e.g. "https://aihomerun.app,https://www.aihomerun.app"
 # Falls back to "*" for local development
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*").strip().strip('"').strip("'")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
+print(f"🌐 CORS allowed origins: {ALLOWED_ORIGINS}")
 
 app.add_middleware(
     CORSMiddleware,
