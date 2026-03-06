@@ -1,0 +1,8 @@
+.env
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.git
+tests/
+*.md

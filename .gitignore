@@ -1,0 +1,21 @@
+# Environment — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Uploads (user videos — not for git)
+uploads/
+
+# macOS
+.DS_Store
