@@ -11,13 +11,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from services.video_processor import save_upload, extract_frames, get_video_info, cleanup_video_dir
 from services.pose_analyzer import PoseAnalyzer
 from services.baseball_metrics import analyze_swing, analyze_pitch
 from services.ai_analyzer import analyze_with_claude
+from services.auth import get_user_id
 from models.schemas import AnalysisResult, AnalysisError
 
 Path(os.getenv("UPLOAD_DIR", "uploads")).mkdir(exist_ok=True)
@@ -76,12 +77,14 @@ async def analyze(
     file: UploadFile = File(..., description="Baseball video file (mp4/mov/avi, max 100 MB)"),
     action_type: str = Form("swing", description="Action type: 'swing' or 'pitch'"),
     age: int = Form(10, description="Player age (6-18)", ge=6, le=18),
+    user_id: str = Depends(get_user_id),
 ):
     if action_type not in ("swing", "pitch"):
         raise HTTPException(status_code=400, detail="action_type must be 'swing' or 'pitch'")
 
     start = time.time()
     video_id = None
+    print(f"👤 Authenticated user: {user_id[:8]}…")
 
     try:
         # 1. Save upload
