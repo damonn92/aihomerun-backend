@@ -98,8 +98,8 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
     )
 
     response = _get_client().messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
+        model="claude-haiku-4-5",
+        max_tokens=600,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )

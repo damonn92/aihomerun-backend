@@ -15,7 +15,7 @@ from fastapi import UploadFile, HTTPException
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 100))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
-FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", 10))
+FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", 6))
 
 
 async def save_upload(file: UploadFile) -> tuple:
@@ -65,7 +65,7 @@ def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> lis
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / video_fps
 
-    max_duration = min(duration_sec, 15.0)  # Cap at 15s to limit memory
+    max_duration = min(duration_sec, 8.0)   # Cap at 8s — swing/pitch is 1-3s, 8s is plenty
     frame_interval = max(1, int(video_fps / target_fps))
 
     frames = []

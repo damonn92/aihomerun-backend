@@ -63,7 +63,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "BaseAI", "model": "claude-sonnet-4-6"}
+    return {"status": "ok", "app": "BaseAI", "model": "claude-haiku-4-5"}
 
 
 @app.post(

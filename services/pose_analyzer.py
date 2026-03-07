@@ -16,7 +16,7 @@ class PoseAnalyzer:
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,      # 视频模式，利用时序信息
-            model_complexity=1,           # 0=轻量, 1=标准, 2=高精度
+            model_complexity=0,           # 0=轻量(快), 1=标准, 2=高精度 — 0 够用且快很多
             smooth_landmarks=True,        # 跨帧平滑
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
