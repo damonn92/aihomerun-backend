@@ -48,11 +48,14 @@ async def save_upload(file: UploadFile) -> tuple:
     return video_id, video_path
 
 
+MAX_FRAME_WIDTH = 640   # Downscale to max 640px wide — keeps MediaPipe accurate, saves ~85% memory
+
+
 def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> list:
     """
     Uniformly sample frames from a video at the target frame rate.
-    Returns a list of numpy arrays in BGR format.
-    Only processes the first 30 seconds to keep latency reasonable.
+    Returns a list of numpy arrays in BGR format (downscaled to MAX_FRAME_WIDTH).
+    Only processes the first 15 seconds to keep latency and memory reasonable.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -62,7 +65,7 @@ def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> lis
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / video_fps
 
-    max_duration = min(duration_sec, 30.0)
+    max_duration = min(duration_sec, 15.0)  # Cap at 15s to limit memory
     frame_interval = max(1, int(video_fps / target_fps))
 
     frames = []
@@ -74,6 +77,13 @@ def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> lis
         ret, frame = cap.read()
         if not ret:
             break
+        # Downscale wide frames to MAX_FRAME_WIDTH — reduces memory 85% for 1080p
+        h, w = frame.shape[:2]
+        if w > MAX_FRAME_WIDTH:
+            scale = MAX_FRAME_WIDTH / w
+            new_w = MAX_FRAME_WIDTH
+            new_h = int(h * scale)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
         frames.append(frame)
         frame_idx += frame_interval
 
