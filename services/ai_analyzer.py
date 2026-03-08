@@ -84,7 +84,7 @@ Generate a professional coaching report. Output must be ONLY this JSON object â€
   "balance_score": <integer 0-100>,
   "strengths": ["<specific strength 1>", "<specific strength 2>", "<specific strength 3>"],
   "improvements": ["<actionable tip 1>", "<actionable tip 2>"],
-  "drill": {"name": "<2-4 word drill name>", "description": "<2-3 sentences, fun, easy at home>", "reps": "<e.g. '20 swings' or null>"},
+  "drill": {{"name": "<2-4 word drill name>", "description": "<2-3 sentences, fun, easy at home>", "reps": "<e.g. '20 swings' or null>"}},
   "encouragement": "<one genuine encouraging sentence for a {age}-year-old>",
   "plain_summary": "<one casual everyday-English sentence about what you saw>",
   "parent_tip": "<one practical sentence for the parent: what to do today in under 10 minutes>"
