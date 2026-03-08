@@ -26,11 +26,47 @@ class AIFeedback(BaseModel):
     technique_score: int                    # 技术分
     power_score: int                        # 力量分
     balance_score: int                      # 平衡分
-    strengths: List[str]                    # 优点列表
-    improvements: List[str]                 # 改进建议
-    drill: str                              # 一个具体练习建议
+    strengths: List[str]                    # 优点列表（3条）
+    improvements: List[str]                 # 改进建议（2条）
+    drill: str                              # 1个针对核心问题的练习
     encouragement: str                      # 鼓励语（针对儿童）
+    plain_summary: str = ""                 # 白话文总结（一句话，无术语）
+    parent_tip: str = ""                    # 家长版：今日练习建议（≤10分钟）
 
+
+# ── Quality Gate ──────────────────────────────────────────────────────────────
+
+class QualityIssue(BaseModel):
+    check: str               # Machine-readable check name, e.g. "low_fps"
+    message: str             # Human-readable explanation
+    severity: str            # "warning" | "error"
+
+
+class QualityGateResult(BaseModel):
+    passed: bool
+    issues: List[QualityIssue]
+    visibility_rate: float   # Fraction of frames where pose was detected
+
+
+# ── History / Comparison ──────────────────────────────────────────────────────
+
+class PreviousSession(BaseModel):
+    """Scores from the most recent prior session — used for before/after card."""
+    session_date: str
+    action_type: str
+    overall_score: int
+    technique_score: int
+    power_score: int
+    balance_score: int
+
+
+class HistorySummary(BaseModel):
+    """Lightweight row for the growth sparkline chart."""
+    session_date: str
+    overall_score: int
+
+
+# ── API Response ──────────────────────────────────────────────────────────────
 
 class AnalysisResult(BaseModel):
     video_id: str
@@ -38,6 +74,9 @@ class AnalysisResult(BaseModel):
     metrics: MotionMetrics
     feedback: AIFeedback
     processing_time_seconds: float
+    quality: Optional[QualityGateResult] = None
+    previous_session: Optional[PreviousSession] = None
+    history: Optional[List[HistorySummary]] = None
 
 
 class AnalysisError(BaseModel):

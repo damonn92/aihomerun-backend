@@ -10,16 +10,21 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from typing import Optional, List
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from services.video_processor import save_upload, extract_frames, get_video_info, cleanup_video_dir
 from services.pose_analyzer import PoseAnalyzer
 from services.baseball_metrics import analyze_swing, analyze_pitch
 from services.ai_analyzer import analyze_with_claude
+from services.quality_gate import check_quality
+from services.session_store import save_session, get_previous_session, get_history
 from services.auth import get_user_id
-from models.schemas import AnalysisResult, AnalysisError
+from models.schemas import (
+    AnalysisResult, AnalysisError,
+    PreviousSession, HistorySummary,
+)
 
 Path(os.getenv("UPLOAD_DIR", "uploads")).mkdir(exist_ok=True)
 
@@ -40,7 +45,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BaseAI API",
     description="AI-powered youth baseball coaching — upload a swing or pitch video and get instant feedback.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -64,7 +69,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "BaseAI", "model": "claude-haiku-4-5"}
+    return {"status": "ok", "app": "BaseAI", "version": "0.2.0", "model": "claude-haiku-4-5"}
 
 
 @app.post(
@@ -90,7 +95,7 @@ async def analyze(
         # 1. Save upload
         video_id, video_path = await save_upload(file)
 
-        # 2. Video info (for logging)
+        # 2. Video info (for logging + quality gate)
         info = get_video_info(video_path)
         print(f"📹 [{video_id[:8]}] {info['width']}x{info['height']} "
               f"{info['fps']:.1f}fps {info['duration_sec']:.1f}s")
@@ -104,25 +109,80 @@ async def analyze(
         valid_count = sum(1 for f in frames_data if f is not None)
         print(f"🦾 [{video_id[:8]}] Valid pose frames: {valid_count}/{len(frames)}")
 
-        # 5. Compute baseball-specific metrics
+        # 5. Quality Gate — run before expensive analysis
+        quality = check_quality(frames, frames_data, info)
+        warn_count = sum(1 for i in quality.issues if i.severity == "warning")
+        err_count  = sum(1 for i in quality.issues if i.severity == "error")
+        print(f"🔍 [{video_id[:8]}] Quality: {'✅ passed' if quality.passed else '❌ failed'} "
+              f"(visibility {quality.visibility_rate:.0%}, {err_count} errors, {warn_count} warnings)")
+
+        if not quality.passed:
+            # Return structured error so the frontend can display per-check messages
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "video_quality_check_failed",
+                    "issues": [i.model_dump() for i in quality.issues],
+                    "visibility_rate": quality.visibility_rate,
+                },
+            )
+
+        # 6. Fetch previous session BEFORE saving (for before/after comparison)
+        prev_row = get_previous_session(user_id, action_type)
+
+        # 7. Compute baseball-specific metrics
         if action_type == "swing":
             metrics = analyze_swing(frames_data)
         else:
             metrics = analyze_pitch(frames_data)
 
-        # 6. Claude AI feedback
+        # 8. Claude AI feedback
         feedback = analyze_with_claude(metrics, age=age)
 
         elapsed = round(time.time() - start, 2)
         print(f"✅ [{video_id[:8]}] Done — score {feedback.overall_score}, {elapsed}s")
 
-        return AnalysisResult(
+        # 9. Build before/after comparison object (if we had a previous session)
+        previous_session = None
+        if prev_row:
+            previous_session = PreviousSession(
+                session_date=prev_row["created_at"],
+                action_type=prev_row["action_type"],
+                overall_score=prev_row["overall_score"],
+                technique_score=prev_row["technique_score"],
+                power_score=prev_row["power_score"],
+                balance_score=prev_row["balance_score"],
+            )
+
+        # 10. Assemble result
+        result = AnalysisResult(
             video_id=video_id,
             action_type=action_type,
             metrics=metrics,
             feedback=feedback,
             processing_time_seconds=elapsed,
+            quality=quality,
+            previous_session=previous_session,
         )
+
+        # 11. Persist to Supabase (graceful failure — won't crash if DB not set up)
+        save_session(user_id, result)
+
+        # 12. Fetch growth history AFTER saving so the current session is included
+        hist_rows = get_history(user_id, action_type, limit=8)
+        if hist_rows:
+            result.history = [
+                HistorySummary(
+                    session_date=r["created_at"],
+                    overall_score=r["overall_score"],
+                )
+                for r in hist_rows
+            ]
+
+        return result
+
+    except HTTPException:
+        raise
 
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -134,6 +194,19 @@ async def analyze(
     finally:
         if video_id:
             cleanup_video_dir(video_id)
+
+
+@app.get(
+    "/history",
+    summary="Get analysis history for the authenticated user",
+)
+async def history_endpoint(
+    action_type: Optional[str] = Query(None, description="Filter by 'swing' or 'pitch'"),
+    limit: int = Query(20, ge=1, le=100, description="Number of sessions to return"),
+    user_id: str = Depends(get_user_id),
+):
+    rows = get_history(user_id, action_type=action_type, limit=limit)
+    return {"history": rows, "count": len(rows)}
 
 
 if __name__ == "__main__":
