@@ -4,7 +4,7 @@ AI analysis module: sends motion metrics to Claude and generates coaching feedba
 import json
 import os
 import anthropic
-from models.schemas import MotionMetrics, AIFeedback
+from models.schemas import MotionMetrics, AIFeedback, DrillInfo
 
 
 def _get_client():
@@ -27,8 +27,10 @@ Output rules — follow every rule exactly:
 2. Focus on the TOP 1-2 issues only. Do not overwhelm the player with a long list.
 3. "strengths": give EXACTLY 3 specific things the player did well.
 4. "improvements": give EXACTLY 2 short, actionable tips. Name the body part and the motion.
-5. "drill": describe ONE focused practice exercise that addresses the #1 improvement area.
-   Make it fun, doable at home, 2-3 sentences. NO lists — write it as flowing sentences.
+5. "drill": a JSON object with three fields:
+     "name"  — a 2-4 word title for the drill (e.g. "Tee Drill", "Hip Rotation"),
+     "description" — 2-3 sentences, fun and doable at home. No lists, flowing prose.
+     "reps"  — a short repetition target (e.g. "20 swings", "3 × 12 reps", "10 sec hold") or null.
 6. "encouragement": one genuine motivating sentence sized for the player's age and score.
 7. "plain_summary": write ONE casual, conversational sentence (like texting a friend) that
    explains what you noticed about the overall mechanics. Use plain everyday English.
@@ -82,7 +84,7 @@ Generate a professional coaching report. Output must be ONLY this JSON object �
   "balance_score": <integer 0-100>,
   "strengths": ["<specific strength 1>", "<specific strength 2>", "<specific strength 3>"],
   "improvements": ["<actionable tip 1>", "<actionable tip 2>"],
-  "drill": "<ONE focused drill for the top issue — 2-3 sentences, fun, easy to do at home>",
+  "drill": {"name": "<2-4 word drill name>", "description": "<2-3 sentences, fun, easy at home>", "reps": "<e.g. '20 swings' or null>"},
   "encouragement": "<one genuine encouraging sentence for a {age}-year-old>",
   "plain_summary": "<one casual everyday-English sentence about what you saw>",
   "parent_tip": "<one practical sentence for the parent: what to do today in under 10 minutes>"
@@ -127,6 +129,18 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
 
     data = json.loads(raw)
 
+    # Build DrillInfo — handle both object (new) and plain string (legacy)
+    raw_drill = data["drill"]
+    if isinstance(raw_drill, dict):
+        drill_obj = DrillInfo(
+            name=raw_drill.get("name", "Practice Drill"),
+            description=raw_drill.get("description", ""),
+            reps=raw_drill.get("reps") or None,
+        )
+    else:
+        # Legacy: Claude returned a plain string — wrap it
+        drill_obj = DrillInfo(name="Practice Drill", description=str(raw_drill), reps=None)
+
     return AIFeedback(
         overall_score=int(data["overall_score"]),
         technique_score=int(data["technique_score"]),
@@ -134,7 +148,7 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
         balance_score=int(data["balance_score"]),
         strengths=data["strengths"],
         improvements=data["improvements"],
-        drill=data["drill"],
+        drill=drill_obj,
         encouragement=data["encouragement"],
         plain_summary=data.get("plain_summary", ""),
         parent_tip=data.get("parent_tip", ""),

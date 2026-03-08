@@ -21,6 +21,12 @@ class MotionMetrics(BaseModel):
     follow_through: bool                    # 是否有充分随挥
 
 
+class DrillInfo(BaseModel):
+    name: str               # Short drill name, e.g. "Tee Drill"
+    description: str        # 2-3 sentence description
+    reps: Optional[str] = None  # e.g. "20 swings", "3 × 12 reps"
+
+
 class AIFeedback(BaseModel):
     overall_score: int                      # 总评分 0-100
     technique_score: int                    # 技术分
@@ -28,7 +34,7 @@ class AIFeedback(BaseModel):
     balance_score: int                      # 平衡分
     strengths: List[str]                    # 优点列表（3条）
     improvements: List[str]                 # 改进建议（2条）
-    drill: str                              # 1个针对核心问题的练习
+    drill: DrillInfo                        # 1个针对核心问题的练习（结构化）
     encouragement: str                      # 鼓励语（针对儿童）
     plain_summary: str = ""                 # 白话文总结（一句话，无术语）
     parent_tip: str = ""                    # 家长版：今日练习建议（≤10分钟）
