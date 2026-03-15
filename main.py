@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     print("🔴 PoseAnalyzer shut down")
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 app = FastAPI(
     title="BaseAI API",
