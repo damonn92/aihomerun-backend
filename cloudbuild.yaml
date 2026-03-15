@@ -1,0 +1,63 @@
+# Cloud Build: Build and deploy API service to Cloud Run
+steps:
+  # Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/aihomerun-api:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/aihomerun-api:latest'
+      - '.'
+
+  # Push image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/$PROJECT_ID/aihomerun-api']
+
+  # Deploy API service
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'aihomerun-api'
+      - '--image=gcr.io/$PROJECT_ID/aihomerun-api:$SHORT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=300'
+      - '--concurrency=20'
+      - '--min-instances=0'
+      - '--max-instances=10'
+      - '--set-env-vars=ENVIRONMENT=production'
+      - '--allow-unauthenticated'
+
+  # Deploy Worker service (same image, different entrypoint)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'aihomerun-worker'
+      - '--image=gcr.io/$PROJECT_ID/aihomerun-api:$SHORT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--memory=4Gi'
+      - '--cpu=2'
+      - '--timeout=600'
+      - '--concurrency=3'
+      - '--min-instances=1'
+      - '--max-instances=5'
+      - '--no-cpu-throttling'
+      - '--set-env-vars=ENVIRONMENT=production'
+      - '--command=python'
+      - '--args=worker.py'
+      - '--no-allow-unauthenticated'
+
+images:
+  - 'gcr.io/$PROJECT_ID/aihomerun-api:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/aihomerun-api:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -12,6 +12,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
+import sentry_sdk
+_sentry_dsn = os.environ.get("SENTRY_DSN", "")
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        traces_sample_rate=0.2,
+        profiles_sample_rate=0.1,
+        environment=os.environ.get("ENVIRONMENT", "development"),
+    )
+
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,17 +38,12 @@ from services.baseball_metrics import analyze_swing, analyze_pitch
 from services.ai_analyzer import analyze_with_claude
 from services.quality_gate import check_quality
 from services.session_store import save_session, get_previous_session, get_history
-from services.auth import (
-    get_user_id,
-    create_access_token,
-    verify_apple_id_token,
-    verify_google_id_token,
-    find_or_create_social_user,
-    find_email_user,
-    create_email_user,
-    verify_password,
+from services.supabase_auth import get_user_id
+from services.supabase_client import get_client as get_supabase
+from services.redis_client import (
+    cache_get, cache_set, make_cache_key,
+    check_rate_limit, is_configured as redis_is_configured,
 )
-from services.d1_client import execute as d1_execute, is_configured as d1_is_configured
 from models.schemas import (
     AnalysisResult, AnalysisError,
     PreviousSession, HistorySummary,
@@ -84,207 +89,12 @@ app.add_middleware(
 
 
 # ──────────────────────────────────────────
-# Auth request/response models
-# ──────────────────────────────────────────
-
-class AuthResponse(BaseModel):
-    access_token: str
-    user_id: str
-    email: Optional[str] = None
-
-class AppleSignInRequest(BaseModel):
-    id_token: str
-    nonce: Optional[str] = None
-
-class GoogleSignInRequest(BaseModel):
-    id_token: str
-
-class EmailSignInRequest(BaseModel):
-    email: str
-    password: str
-
-class EmailSignUpRequest(BaseModel):
-    email: str
-    password: str
-
-class ProfileResponse(BaseModel):
-    id: str
-    display_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-    age_group: Optional[str] = None
-
-class ProfileUpdateRequest(BaseModel):
-    display_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-    age_group: Optional[str] = None
-
-class ChildModel(BaseModel):
-    id: Optional[str] = None
-    name: Optional[str] = None
-    age: Optional[int] = None
-
-class LeaderboardRow(BaseModel):
-    entry_id: str
-    initials: str
-    display_name: str
-    score: int
-    is_me: bool
-    is_real_user: bool
-
-class TrendRow(BaseModel):
-    session_number: int
-    overall_score: int
-    created_at: str
-
-
-# ──────────────────────────────────────────
 # Health
 # ──────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok", "app": "BaseAI", "version": APP_VERSION}
-
-
-# ──────────────────────────────────────────
-# Auth endpoints
-# ──────────────────────────────────────────
-
-@app.post("/auth/apple", response_model=AuthResponse)
-async def auth_apple(req: AppleSignInRequest):
-    """Authenticate with Apple Sign-In identity token."""
-    apple_payload = await asyncio.to_thread(verify_apple_id_token, req.id_token)
-    apple_user_id = apple_payload.get("sub")
-    email = apple_payload.get("email")
-
-    user = await asyncio.to_thread(
-        find_or_create_social_user, "apple", apple_user_id, email
-    )
-    token = create_access_token(user["id"], user.get("email"))
-    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
-
-
-@app.post("/auth/google", response_model=AuthResponse)
-async def auth_google(req: GoogleSignInRequest):
-    """Authenticate with Google Sign-In identity token."""
-    google_payload = await asyncio.to_thread(verify_google_id_token, req.id_token)
-    google_user_id = google_payload.get("sub")
-    email = google_payload.get("email")
-
-    user = await asyncio.to_thread(
-        find_or_create_social_user, "google", google_user_id, email
-    )
-    token = create_access_token(user["id"], user.get("email"))
-    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
-
-
-@app.post("/auth/email/signin", response_model=AuthResponse)
-async def auth_email_signin(req: EmailSignInRequest):
-    """Sign in with email and password."""
-    user = await asyncio.to_thread(find_email_user, req.email)
-    if not user:
-        raise HTTPException(401, "Invalid email or password")
-    if not verify_password(req.password, user.get("password_hash", "")):
-        raise HTTPException(401, "Invalid email or password")
-
-    token = create_access_token(user["id"], user.get("email"))
-    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
-
-
-@app.post("/auth/email/signup", response_model=AuthResponse)
-async def auth_email_signup(req: EmailSignUpRequest):
-    """Create a new account with email and password."""
-    existing = await asyncio.to_thread(find_email_user, req.email)
-    if existing:
-        raise HTTPException(409, "Email already registered")
-
-    if len(req.password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters")
-
-    user = await asyncio.to_thread(create_email_user, req.email, req.password)
-    token = create_access_token(user["id"], user.get("email"))
-    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
-
-
-# ──────────────────────────────────────────
-# Profile endpoints
-# ──────────────────────────────────────────
-
-@app.get("/profile", response_model=ProfileResponse)
-async def get_profile(user_id: str = Depends(get_user_id)):
-    rows = await asyncio.to_thread(
-        d1_execute,
-        "SELECT id, display_name, avatar_url, age_group FROM profiles WHERE id = ?1 LIMIT 1",
-        [user_id],
-    )
-    if not rows:
-        return ProfileResponse(id=user_id)
-    return ProfileResponse(**rows[0])
-
-
-@app.put("/profile", response_model=ProfileResponse)
-async def update_profile(req: ProfileUpdateRequest, user_id: str = Depends(get_user_id)):
-    # Upsert profile
-    await asyncio.to_thread(
-        d1_execute,
-        """INSERT INTO profiles (id, display_name, avatar_url, age_group, updated_at)
-           VALUES (?1, ?2, ?3, ?4, datetime('now'))
-           ON CONFLICT(id) DO UPDATE SET
-             display_name = ?2, avatar_url = ?3, age_group = ?4, updated_at = datetime('now')""",
-        [user_id, req.display_name, req.avatar_url, req.age_group],
-    )
-    return ProfileResponse(
-        id=user_id,
-        display_name=req.display_name,
-        avatar_url=req.avatar_url,
-        age_group=req.age_group,
-    )
-
-
-# ──────────────────────────────────────────
-# Children endpoints
-# ──────────────────────────────────────────
-
-@app.get("/children", response_model=List[ChildModel])
-async def get_children(user_id: str = Depends(get_user_id)):
-    rows = await asyncio.to_thread(
-        d1_execute,
-        "SELECT id, name, age FROM children WHERE parent_id = ?1 ORDER BY created_at",
-        [user_id],
-    )
-    return [ChildModel(**r) for r in rows]
-
-
-@app.post("/children", response_model=ChildModel)
-async def create_child(child: ChildModel, user_id: str = Depends(get_user_id)):
-    import uuid
-    child_id = uuid.uuid4().hex
-    await asyncio.to_thread(
-        d1_execute,
-        "INSERT INTO children (id, parent_id, name, age) VALUES (?1, ?2, ?3, ?4)",
-        [child_id, user_id, child.name, child.age],
-    )
-    return ChildModel(id=child_id, name=child.name, age=child.age)
-
-
-@app.put("/children/{child_id}", response_model=ChildModel)
-async def update_child(child_id: str, child: ChildModel, user_id: str = Depends(get_user_id)):
-    await asyncio.to_thread(
-        d1_execute,
-        "UPDATE children SET name = ?1, age = ?2 WHERE id = ?3 AND parent_id = ?4",
-        [child.name, child.age, child_id, user_id],
-    )
-    return ChildModel(id=child_id, name=child.name, age=child.age)
-
-
-@app.delete("/children/{child_id}")
-async def delete_child(child_id: str, user_id: str = Depends(get_user_id)):
-    await asyncio.to_thread(
-        d1_execute,
-        "DELETE FROM children WHERE id = ?1 AND parent_id = ?2",
-        [child_id, user_id],
-    )
-    return {"ok": True}
 
 
 # ──────────────────────────────────────────
@@ -296,20 +106,21 @@ async def get_leaderboard(
     age_group: str = Query("all"),
     user_id: str = Depends(get_user_id),
 ):
-    """
-    Simple leaderboard: top 20 users by best overall_score.
-    """
-    rows = await asyncio.to_thread(
-        d1_execute,
-        """SELECT a.user_id, MAX(a.overall_score) as score,
-                  COALESCE(p.display_name, '') as display_name
-           FROM analyses a
-           LEFT JOIN profiles p ON p.id = a.user_id
-           GROUP BY a.user_id
-           ORDER BY score DESC
-           LIMIT 20""",
-        [],
-    )
+    """Top 20 users by best overall_score."""
+    # Check cache first (user-independent part)
+    cache_key = make_cache_key("leaderboard", age_group)
+    cached_rows = cache_get(cache_key) if redis_is_configured() else None
+
+    if cached_rows is not None:
+        rows = cached_rows
+    else:
+        sb = get_supabase()
+        resp = await asyncio.to_thread(
+            lambda: sb.rpc("leaderboard_top20", {}).execute()
+        )
+        rows = resp.data or []
+        if redis_is_configured():
+            cache_set(cache_key, rows, ttl=60)
 
     result = []
     for i, r in enumerate(rows):
@@ -333,16 +144,26 @@ async def get_trend(
     user_id: str = Depends(get_user_id),
 ):
     """Get score trend for the authenticated user."""
-    rows = await asyncio.to_thread(
-        d1_execute,
-        """SELECT overall_score, created_at
-           FROM analyses
-           WHERE user_id = ?1
-           ORDER BY created_at DESC
-           LIMIT ?2""",
-        [user_id, limit],
-    )
-    rows = list(reversed(rows))  # oldest first
+    cache_key = make_cache_key("trend", user_id)
+    cached = cache_get(cache_key) if redis_is_configured() else None
+
+    if cached is not None:
+        rows = cached
+    else:
+        sb = get_supabase()
+        resp = await asyncio.to_thread(
+            lambda: (
+                sb.table("analyses")
+                .select("overall_score, created_at")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+        )
+        rows = list(reversed(resp.data or []))
+        if redis_is_configured():
+            cache_set(cache_key, rows, ttl=30)
     result = []
     for i, r in enumerate(rows):
         result.append({
@@ -355,14 +176,27 @@ async def get_trend(
 
 @app.get("/best-score")
 async def get_best_score(user_id: str = Depends(get_user_id)):
-    rows = await asyncio.to_thread(
-        d1_execute,
-        """SELECT MAX(overall_score) as best_score
-           FROM analyses WHERE user_id = ?1""",
-        [user_id],
+    cache_key = make_cache_key("best", user_id)
+    cached = cache_get(cache_key) if redis_is_configured() else None
+    if cached is not None:
+        return cached
+
+    sb = get_supabase()
+    resp = await asyncio.to_thread(
+        lambda: (
+            sb.table("analyses")
+            .select("overall_score")
+            .eq("user_id", user_id)
+            .order("overall_score", desc=True)
+            .limit(1)
+            .execute()
+        )
     )
-    best = rows[0].get("best_score") if rows else None
-    return {"best_score": best}
+    best = resp.data[0]["overall_score"] if resp.data else None
+    result = {"best_score": best}
+    if redis_is_configured():
+        cache_set(cache_key, result, ttl=30)
+    return result
 
 
 # ──────────────────────────────────────────
@@ -371,23 +205,26 @@ async def get_best_score(user_id: str = Depends(get_user_id)):
 
 @app.delete("/account")
 async def delete_account(user_id: str = Depends(get_user_id)):
-    """Delete all user data."""
-    await asyncio.to_thread(d1_execute, "DELETE FROM analyses WHERE user_id = ?1", [user_id])
-    await asyncio.to_thread(d1_execute, "DELETE FROM children WHERE parent_id = ?1", [user_id])
-    await asyncio.to_thread(d1_execute, "DELETE FROM profiles WHERE id = ?1", [user_id])
-    await asyncio.to_thread(d1_execute, "DELETE FROM users WHERE id = ?1", [user_id])
+    """Delete all user data (analyses). Profiles/children managed via Supabase directly."""
+    sb = get_supabase()
+    await asyncio.to_thread(
+        lambda: sb.table("analyses").delete().eq("user_id", user_id).execute()
+    )
     return {"ok": True}
 
 
 # ──────────────────────────────────────────
-# Video Analysis
+# Video Analysis (Async)
 # ──────────────────────────────────────────
+
+from services.job_manager import create_job, get_job_status, get_analysis_result
+from fastapi.responses import JSONResponse
+
 
 @app.post(
     "/analyze",
-    response_model=AnalysisResult,
-    responses={400: {"model": AnalysisError}, 422: {"model": AnalysisError}},
-    summary="Upload a baseball video and get AI coaching feedback",
+    status_code=202,
+    summary="Upload a baseball video for async AI coaching analysis",
 )
 async def analyze(
     file: UploadFile = File(..., description="Baseball video file (mp4/mov/avi, max 100 MB)"),
@@ -398,123 +235,74 @@ async def analyze(
     if action_type not in ("swing", "pitch"):
         raise HTTPException(status_code=400, detail="action_type must be 'swing' or 'pitch'")
 
-    start = time.time()
+    # Rate limit: 10 analyses per hour per user
+    if redis_is_configured() and not check_rate_limit(user_id, "analyze", limit=10, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+
     video_id = None
-    logger.info("Authenticated user: %s…", user_id[:8])
+    try:
+        # 1. Save upload to temp
+        video_id, video_path = await save_upload(file)
 
-    async with _analysis_semaphore:
-        try:
-            # 1. Save upload
-            video_id, video_path = await save_upload(file)
+        # 2. Upload raw video to R2 immediately
+        video_url = await asyncio.to_thread(upload_to_storage, video_id, video_path, user_id)
+        if not video_url:
+            raise HTTPException(status_code=500, detail="Failed to upload video. Please try again.")
 
-            # 2. Video info (for logging + quality gate)
-            info = await asyncio.to_thread(get_video_info, video_path)
-            logger.info("[%s] %dx%d %.1ffps %.1fs",
-                        video_id[:8], info['width'], info['height'],
-                        info['fps'], info['duration_sec'])
+        # Build storage key (same format as upload_to_storage uses)
+        ext = video_path.suffix
+        storage_key = f"{user_id}/{video_id}{ext}"
 
-            # 3. Extract frames
-            frames = await asyncio.to_thread(extract_frames, video_path)
-            logger.info("[%s] %d frames extracted", video_id[:8], len(frames))
+        # 3. Create async job
+        job_id = await asyncio.to_thread(
+            create_job, user_id, action_type, age, storage_key
+        )
 
-            # 4. MediaPipe pose estimation
-            frames_data = await asyncio.to_thread(pose_analyzer.analyze_frames, frames)
-            valid_count = sum(1 for f in frames_data if f is not None)
-            logger.info("[%s] Valid pose frames: %d/%d", video_id[:8], valid_count, len(frames))
+        return {"job_id": job_id, "status": "pending"}
 
-            # 5. Quality Gate — run before expensive analysis
-            quality = await asyncio.to_thread(check_quality, frames, frames_data, info)
-            logger.info("[%s] Quality: %s (visibility %.0f%%)",
-                        video_id[:8], "passed" if quality.passed else "failed",
-                        quality.visibility_rate * 100)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to create analysis job")
+        raise HTTPException(status_code=500, detail="Failed to start analysis. Please try again.")
+    finally:
+        if video_id:
+            cleanup_video_dir(video_id)
 
-            if not quality.passed:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "error": "video_quality_check_failed",
-                        "issues": [i.model_dump() for i in quality.issues],
-                        "visibility_rate": quality.visibility_rate,
-                    },
-                )
 
-            # 6. Fetch previous session BEFORE saving (for before/after comparison)
-            prev_row = await asyncio.to_thread(get_previous_session, user_id, action_type)
+@app.get(
+    "/analyze/status/{job_id}",
+    summary="Check the status of an analysis job",
+)
+async def analyze_status(
+    job_id: str,
+    user_id: str = Depends(get_user_id),
+):
+    job = await asyncio.to_thread(get_job_status, job_id, user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-            # 7. Compute baseball-specific metrics
-            if action_type == "swing":
-                metrics = await asyncio.to_thread(analyze_swing, frames_data)
-            else:
-                metrics = await asyncio.to_thread(analyze_pitch, frames_data)
+    response = {
+        "job_id": job["id"],
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+    }
 
-            # 8. Claude AI feedback
-            feedback = await asyncio.to_thread(analyze_with_claude, metrics, age)
-
-            elapsed = round(time.time() - start, 2)
-            logger.info("[%s] Done — score %d, %.2fs", video_id[:8], feedback.overall_score, elapsed)
-
-            # 9. Upload video to cloud storage BEFORE cleanup
-            video_url = await asyncio.to_thread(upload_to_storage, video_id, video_path, user_id)
-            if video_url:
-                logger.info("[%s] Video uploaded to R2: %s", video_id[:8], video_url[:80])
-
-            # 10. Build before/after comparison object (if we had a previous session)
-            previous_session = None
-            if prev_row:
-                previous_session = PreviousSession(
-                    session_date=prev_row["created_at"],
-                    action_type=prev_row["action_type"],
-                    overall_score=prev_row["overall_score"],
-                    technique_score=prev_row["technique_score"],
-                    power_score=prev_row["power_score"],
-                    balance_score=prev_row["balance_score"],
-                    video_id=prev_row.get("video_id"),
-                    video_url=prev_row.get("video_url"),
-                )
-
-            # 11. Assemble result
-            result = AnalysisResult(
-                video_id=video_id,
-                action_type=action_type,
-                metrics=metrics,
-                feedback=feedback,
-                processing_time_seconds=elapsed,
-                quality=quality,
-                previous_session=previous_session,
-                video_url=video_url,
+    if job["status"] == "completed" and job.get("analysis_id"):
+        result = await asyncio.to_thread(get_analysis_result, job["analysis_id"])
+        if result:
+            # Fetch history for the completed result
+            hist_rows = await asyncio.to_thread(
+                get_history, user_id, result.get("action_type"), 8
             )
-
-            # 12. Persist to D1 (graceful failure — won't crash if DB not set up)
-            await asyncio.to_thread(save_session, user_id, result)
-
-            # 13. Fetch growth history AFTER saving so the current session is included
-            hist_rows = await asyncio.to_thread(get_history, user_id, action_type, 8)
+            response["result"] = result
             if hist_rows:
-                result.history = [
-                    HistorySummary(
-                        session_date=r["created_at"],
-                        overall_score=r["overall_score"],
-                        video_id=r.get("video_id"),
-                        video_url=r.get("video_url"),
-                    )
-                    for r in hist_rows
-                ]
+                response["result"]["history"] = hist_rows
 
-            return result
+    elif job["status"] == "failed":
+        response["error"] = job.get("error_message", "Analysis failed")
 
-        except HTTPException:
-            raise
-
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-
-        except Exception as e:
-            logger.exception("[%s] Analysis error", video_id[:8] if video_id else "?")
-            raise HTTPException(status_code=500, detail="Analysis failed. Please try again.")
-
-        finally:
-            if video_id:
-                cleanup_video_dir(video_id)
+    return response
 
 
 @app.get(

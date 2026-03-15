@@ -1,5 +1,7 @@
 """
 AI analysis module: sends motion metrics to Claude and generates coaching feedback.
+
+Includes caching (via Redis) and graceful degradation when Claude is unavailable.
 """
 from __future__ import annotations
 
@@ -22,7 +24,11 @@ def _get_client() -> anthropic.Anthropic:
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
-        _anthropic_client = anthropic.Anthropic(api_key=key, max_retries=3)
+        _anthropic_client = anthropic.Anthropic(
+            api_key=key,
+            max_retries=3,
+            timeout=30.0,
+        )
     return _anthropic_client
 
 
@@ -68,15 +74,15 @@ def build_metrics_description(metrics: MotionMetrics, age: int) -> str:
         "",
         "[Motion Data]",
         f"- Peak wrist speed: {metrics.peak_wrist_speed:.1f} px/frame  (reference: >15 is good for youth players)",
-        f"- Hip-shoulder separation: {metrics.hip_shoulder_separation:.1f}°  (ideal >25°, indicates full trunk rotation)",
-        f"- Balance score: {metrics.balance_score:.2f}  (0–1 scale, closer to 1 = more stable)",
+        f"- Hip-shoulder separation: {metrics.hip_shoulder_separation:.1f}\u00b0  (ideal >25\u00b0, indicates full trunk rotation)",
+        f"- Balance score: {metrics.balance_score:.2f}  (0\u20131 scale, closer to 1 = more stable)",
         f"- Follow-through completed: {'Yes' if metrics.follow_through else 'No'}",
         "",
         "[Joint Angles]",
-        f"- Hitting/throwing elbow angle: {a.elbow_angle:.1f}°  (ideal for swing: 90–110°, pitch: 85–105°)",
-        f"- Shoulder tilt: {a.shoulder_angle:.1f}°  (closer to 0° = level shoulders; ideal <15°)",
-        f"- Hip rotation: {a.hip_rotation:.1f}°",
-        f"- Front knee bend: {a.knee_bend:.1f}°  (ideal 130–160°; too straight or too bent both reduce power)",
+        f"- Hitting/throwing elbow angle: {a.elbow_angle:.1f}\u00b0  (ideal for swing: 90\u2013110\u00b0, pitch: 85\u2013105\u00b0)",
+        f"- Shoulder tilt: {a.shoulder_angle:.1f}\u00b0  (closer to 0\u00b0 = level shoulders; ideal <15\u00b0)",
+        f"- Hip rotation: {a.hip_rotation:.1f}\u00b0",
+        f"- Front knee bend: {a.knee_bend:.1f}\u00b0  (ideal 130\u2013160\u00b0; too straight or too bent both reduce power)",
         f"- Spine/stride index: {a.spine_tilt:.1f}",
     ]
 
@@ -111,19 +117,87 @@ Generate a professional coaching report. Output must be ONLY this JSON object �
 """
 
 
+def _fallback_feedback(metrics: MotionMetrics) -> AIFeedback:
+    """
+    Generate a basic feedback response from metrics alone when Claude is unavailable.
+    No AI commentary — just heuristic scores.
+    """
+    # Simple heuristic scoring based on metrics
+    tech = min(100, max(0, int(50 + (metrics.joint_angles.elbow_angle - 90) * 0.5)))
+    power = min(100, max(0, int(metrics.peak_wrist_speed * 3)))
+    balance = min(100, max(0, int(metrics.balance_score * 100)))
+    overall = (tech + power + balance) // 3
+
+    return AIFeedback(
+        overall_score=overall,
+        technique_score=tech,
+        power_score=power,
+        balance_score=balance,
+        strengths=[
+            "Good effort on this swing!",
+            "You completed the full motion.",
+            "Keep practicing to improve!",
+        ],
+        improvements=[
+            "Focus on your hip rotation for more power.",
+            "Try to keep your balance through the follow-through.",
+        ],
+        drill=DrillInfo(
+            name="Basic Tee Drill",
+            description="Set up a tee at waist height and take 20 easy swings focusing on smooth form.",
+            reps="20 swings",
+        ),
+        encouragement="Great job getting out there and practicing!",
+        plain_summary="We captured your motion but our AI coach is taking a break — scores are estimated from your data.",
+        parent_tip="Have your player take 20 easy tee swings focusing on balance and form.",
+    )
+
+
+def _try_cache_get(cache_key: str):
+    """Try to get cached result, returns None if Redis not available."""
+    try:
+        from services.redis_client import cache_get, is_configured
+        if is_configured():
+            return cache_get(cache_key)
+    except Exception:
+        pass
+    return None
+
+
+def _try_cache_set(cache_key: str, value, ttl: int = 86400):
+    """Try to cache result, silently fails if Redis not available."""
+    try:
+        from services.redis_client import cache_set, is_configured
+        if is_configured():
+            cache_set(cache_key, value, ttl)
+    except Exception:
+        pass
+
+
 def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
     """
     Call Claude API to analyze motion metrics and generate coaching feedback.
-
-    Args:
-        metrics: MotionMetrics computed from baseball_metrics module
-        age: player age in years (default 10)
-
-    Returns:
-        AIFeedback object with scores, strengths, improvements, drill, and encouragement
+    Falls back to heuristic scoring if Claude is unavailable.
+    Results are cached in Redis for 24 hours.
     """
     action = "batting swing" if metrics.action_type == "swing" else "pitching"
     metrics_desc = build_metrics_description(metrics, age)
+
+    # Check cache
+    try:
+        from services.redis_client import hash_for_cache, make_cache_key
+        cache_key = make_cache_key("ai", hash_for_cache({
+            "metrics": metrics_desc,
+            "age": age,
+        }))
+    except Exception:
+        cache_key = None
+
+    if cache_key:
+        cached = _try_cache_get(cache_key)
+        if cached:
+            logger.info("AI feedback cache hit")
+            return AIFeedback(**cached)
 
     user_prompt = USER_PROMPT_TEMPLATE.format(
         age=age,
@@ -131,12 +205,16 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
         metrics_desc=metrics_desc,
     )
 
-    response = _get_client().messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=800,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    try:
+        response = _get_client().messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=800,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except Exception as exc:
+        logger.error("Claude API call failed: %s", exc)
+        return _fallback_feedback(metrics)
 
     raw = response.content[0].text.strip()
 
@@ -150,7 +228,11 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
         if match:
             raw = match.group(0)
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse Claude response: %s", exc)
+        return _fallback_feedback(metrics)
 
     # Clamp all scores to 0-100 range
     for key in ("overall_score", "technique_score", "power_score", "balance_score"):
@@ -168,7 +250,7 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
         # Legacy: Claude returned a plain string — wrap it
         drill_obj = DrillInfo(name="Practice Drill", description=str(raw_drill), reps=None)
 
-    return AIFeedback(
+    feedback = AIFeedback(
         overall_score=int(data["overall_score"]),
         technique_score=int(data["technique_score"]),
         power_score=int(data["power_score"]),
@@ -180,3 +262,9 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
         plain_summary=data.get("plain_summary", ""),
         parent_tip=data.get("parent_tip", ""),
     )
+
+    # Cache result for 24 hours
+    if cache_key:
+        _try_cache_set(cache_key, feedback.model_dump(), ttl=86400)
+
+    return feedback

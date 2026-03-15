@@ -1,15 +1,14 @@
 """
-Session storage — persists analysis results to Cloudflare D1 for history and comparison.
+Session storage — persists analysis results to Supabase PostgreSQL.
 
-Gracefully degrades to no-ops if D1 is not configured.
+Gracefully degrades to no-ops if Supabase is not configured.
 """
 from __future__ import annotations
 
-import uuid
 import logging
 from typing import Optional, List
 
-from services.d1_client import execute, is_configured
+from services.supabase_client import get_client, is_configured
 
 logger = logging.getLogger(__name__)
 
@@ -24,33 +23,27 @@ def save_session(user_id: str, result) -> Optional[str]:
     try:
         fb = result.feedback
         mt = result.metrics
-        row_id = uuid.uuid4().hex
 
-        execute(
-            """INSERT INTO analyses
-               (id, user_id, action_type, overall_score, technique_score,
-                power_score, balance_score, peak_wrist_speed,
-                hip_shoulder_separation, balance_metric, follow_through,
-                plain_summary, video_id, video_url)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)""",
-            [
-                row_id,
-                user_id,
-                result.action_type,
-                fb.overall_score,
-                fb.technique_score,
-                fb.power_score,
-                fb.balance_score,
-                mt.peak_wrist_speed,
-                mt.hip_shoulder_separation,
-                mt.balance_score,
-                1 if mt.follow_through else 0,
-                fb.plain_summary,
-                result.video_id,
-                getattr(result, "video_url", None),
-            ],
-        )
-        return row_id
+        row = {
+            "user_id": user_id,
+            "action_type": result.action_type,
+            "overall_score": fb.overall_score,
+            "technique_score": fb.technique_score,
+            "power_score": fb.power_score,
+            "balance_score": fb.balance_score,
+            "peak_wrist_speed": mt.peak_wrist_speed,
+            "hip_shoulder_separation": mt.hip_shoulder_separation,
+            "balance_metric": mt.balance_score,
+            "follow_through": mt.follow_through,
+            "plain_summary": fb.plain_summary,
+            "video_id": result.video_id,
+            "video_url": getattr(result, "video_url", None),
+        }
+
+        resp = get_client().table("analyses").insert(row).execute()
+        if resp.data:
+            return resp.data[0].get("id")
+        return None
     except Exception as exc:
         logger.warning("save_session failed: %s", exc)
         return None
@@ -64,17 +57,21 @@ def get_previous_session(user_id: str, action_type: str) -> Optional[dict]:
     if not is_configured():
         return None
     try:
-        rows = execute(
-            """SELECT id, created_at, action_type, overall_score,
-                      technique_score, power_score, balance_score,
-                      video_id, video_url
-               FROM analyses
-               WHERE user_id = ?1 AND action_type = ?2
-               ORDER BY created_at DESC
-               LIMIT 1""",
-            [user_id, action_type],
+        resp = (
+            get_client()
+            .table("analyses")
+            .select(
+                "id, created_at, action_type, overall_score, "
+                "technique_score, power_score, balance_score, "
+                "video_id, video_url"
+            )
+            .eq("user_id", user_id)
+            .eq("action_type", action_type)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
         )
-        return rows[0] if rows else None
+        return resp.data[0] if resp.data else None
     except Exception as exc:
         logger.warning("get_previous_session failed: %s", exc)
         return None
@@ -92,27 +89,20 @@ def get_history(
     if not is_configured():
         return []
     try:
+        query = (
+            get_client()
+            .table("analyses")
+            .select(
+                "created_at, overall_score, technique_score, "
+                "power_score, balance_score, video_id, video_url"
+            )
+            .eq("user_id", user_id)
+        )
         if action_type:
-            rows = execute(
-                """SELECT created_at, overall_score, technique_score,
-                          power_score, balance_score, video_id, video_url
-                   FROM analyses
-                   WHERE user_id = ?1 AND action_type = ?2
-                   ORDER BY created_at DESC
-                   LIMIT ?3""",
-                [user_id, action_type, limit],
-            )
-        else:
-            rows = execute(
-                """SELECT created_at, overall_score, technique_score,
-                          power_score, balance_score, video_id, video_url
-                   FROM analyses
-                   WHERE user_id = ?1
-                   ORDER BY created_at DESC
-                   LIMIT ?2""",
-                [user_id, limit],
-            )
-        return list(reversed(rows))  # oldest → newest for chart x-axis
+            query = query.eq("action_type", action_type)
+
+        resp = query.order("created_at", desc=True).limit(limit).execute()
+        return list(reversed(resp.data)) if resp.data else []
     except Exception as exc:
         logger.warning("get_history failed: %s", exc)
         return []
