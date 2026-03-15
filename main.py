@@ -15,6 +15,7 @@ load_dotenv()
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,17 @@ from services.baseball_metrics import analyze_swing, analyze_pitch
 from services.ai_analyzer import analyze_with_claude
 from services.quality_gate import check_quality
 from services.session_store import save_session, get_previous_session, get_history
-from services.auth import get_user_id
+from services.auth import (
+    get_user_id,
+    create_access_token,
+    verify_apple_id_token,
+    verify_google_id_token,
+    find_or_create_social_user,
+    find_email_user,
+    create_email_user,
+    verify_password,
+)
+from services.d1_client import execute as d1_execute, is_configured as d1_is_configured
 from models.schemas import (
     AnalysisResult, AnalysisError,
     PreviousSession, HistorySummary,
@@ -49,7 +60,7 @@ async def lifespan(app: FastAPI):
     print("🔴 PoseAnalyzer shut down")
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 app = FastAPI(
     title="BaseAI API",
@@ -67,19 +78,310 @@ print(f"🌐 CORS allowed origins: {ALLOWED_ORIGINS}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
 
 # ──────────────────────────────────────────
-# Routes
+# Auth request/response models
+# ──────────────────────────────────────────
+
+class AuthResponse(BaseModel):
+    access_token: str
+    user_id: str
+    email: Optional[str] = None
+
+class AppleSignInRequest(BaseModel):
+    id_token: str
+    nonce: Optional[str] = None
+
+class GoogleSignInRequest(BaseModel):
+    id_token: str
+
+class EmailSignInRequest(BaseModel):
+    email: str
+    password: str
+
+class EmailSignUpRequest(BaseModel):
+    email: str
+    password: str
+
+class ProfileResponse(BaseModel):
+    id: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    age_group: Optional[str] = None
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    age_group: Optional[str] = None
+
+class ChildModel(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    age: Optional[int] = None
+
+class LeaderboardRow(BaseModel):
+    entry_id: str
+    initials: str
+    display_name: str
+    score: int
+    is_me: bool
+    is_real_user: bool
+
+class TrendRow(BaseModel):
+    session_number: int
+    overall_score: int
+    created_at: str
+
+
+# ──────────────────────────────────────────
+# Health
 # ──────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok", "app": "BaseAI", "version": APP_VERSION}
 
+
+# ──────────────────────────────────────────
+# Auth endpoints
+# ──────────────────────────────────────────
+
+@app.post("/auth/apple", response_model=AuthResponse)
+async def auth_apple(req: AppleSignInRequest):
+    """Authenticate with Apple Sign-In identity token."""
+    apple_payload = await asyncio.to_thread(verify_apple_id_token, req.id_token)
+    apple_user_id = apple_payload.get("sub")
+    email = apple_payload.get("email")
+
+    user = await asyncio.to_thread(
+        find_or_create_social_user, "apple", apple_user_id, email
+    )
+    token = create_access_token(user["id"], user.get("email"))
+    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
+
+
+@app.post("/auth/google", response_model=AuthResponse)
+async def auth_google(req: GoogleSignInRequest):
+    """Authenticate with Google Sign-In identity token."""
+    google_payload = await asyncio.to_thread(verify_google_id_token, req.id_token)
+    google_user_id = google_payload.get("sub")
+    email = google_payload.get("email")
+
+    user = await asyncio.to_thread(
+        find_or_create_social_user, "google", google_user_id, email
+    )
+    token = create_access_token(user["id"], user.get("email"))
+    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
+
+
+@app.post("/auth/email/signin", response_model=AuthResponse)
+async def auth_email_signin(req: EmailSignInRequest):
+    """Sign in with email and password."""
+    user = await asyncio.to_thread(find_email_user, req.email)
+    if not user:
+        raise HTTPException(401, "Invalid email or password")
+    if not verify_password(req.password, user.get("password_hash", "")):
+        raise HTTPException(401, "Invalid email or password")
+
+    token = create_access_token(user["id"], user.get("email"))
+    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
+
+
+@app.post("/auth/email/signup", response_model=AuthResponse)
+async def auth_email_signup(req: EmailSignUpRequest):
+    """Create a new account with email and password."""
+    existing = await asyncio.to_thread(find_email_user, req.email)
+    if existing:
+        raise HTTPException(409, "Email already registered")
+
+    if len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    user = await asyncio.to_thread(create_email_user, req.email, req.password)
+    token = create_access_token(user["id"], user.get("email"))
+    return AuthResponse(access_token=token, user_id=user["id"], email=user.get("email"))
+
+
+# ──────────────────────────────────────────
+# Profile endpoints
+# ──────────────────────────────────────────
+
+@app.get("/profile", response_model=ProfileResponse)
+async def get_profile(user_id: str = Depends(get_user_id)):
+    rows = await asyncio.to_thread(
+        d1_execute,
+        "SELECT id, display_name, avatar_url, age_group FROM profiles WHERE id = ?1 LIMIT 1",
+        [user_id],
+    )
+    if not rows:
+        return ProfileResponse(id=user_id)
+    return ProfileResponse(**rows[0])
+
+
+@app.put("/profile", response_model=ProfileResponse)
+async def update_profile(req: ProfileUpdateRequest, user_id: str = Depends(get_user_id)):
+    # Upsert profile
+    await asyncio.to_thread(
+        d1_execute,
+        """INSERT INTO profiles (id, display_name, avatar_url, age_group, updated_at)
+           VALUES (?1, ?2, ?3, ?4, datetime('now'))
+           ON CONFLICT(id) DO UPDATE SET
+             display_name = ?2, avatar_url = ?3, age_group = ?4, updated_at = datetime('now')""",
+        [user_id, req.display_name, req.avatar_url, req.age_group],
+    )
+    return ProfileResponse(
+        id=user_id,
+        display_name=req.display_name,
+        avatar_url=req.avatar_url,
+        age_group=req.age_group,
+    )
+
+
+# ──────────────────────────────────────────
+# Children endpoints
+# ──────────────────────────────────────────
+
+@app.get("/children", response_model=List[ChildModel])
+async def get_children(user_id: str = Depends(get_user_id)):
+    rows = await asyncio.to_thread(
+        d1_execute,
+        "SELECT id, name, age FROM children WHERE parent_id = ?1 ORDER BY created_at",
+        [user_id],
+    )
+    return [ChildModel(**r) for r in rows]
+
+
+@app.post("/children", response_model=ChildModel)
+async def create_child(child: ChildModel, user_id: str = Depends(get_user_id)):
+    import uuid
+    child_id = uuid.uuid4().hex
+    await asyncio.to_thread(
+        d1_execute,
+        "INSERT INTO children (id, parent_id, name, age) VALUES (?1, ?2, ?3, ?4)",
+        [child_id, user_id, child.name, child.age],
+    )
+    return ChildModel(id=child_id, name=child.name, age=child.age)
+
+
+@app.put("/children/{child_id}", response_model=ChildModel)
+async def update_child(child_id: str, child: ChildModel, user_id: str = Depends(get_user_id)):
+    await asyncio.to_thread(
+        d1_execute,
+        "UPDATE children SET name = ?1, age = ?2 WHERE id = ?3 AND parent_id = ?4",
+        [child.name, child.age, child_id, user_id],
+    )
+    return ChildModel(id=child_id, name=child.name, age=child.age)
+
+
+@app.delete("/children/{child_id}")
+async def delete_child(child_id: str, user_id: str = Depends(get_user_id)):
+    await asyncio.to_thread(
+        d1_execute,
+        "DELETE FROM children WHERE id = ?1 AND parent_id = ?2",
+        [child_id, user_id],
+    )
+    return {"ok": True}
+
+
+# ──────────────────────────────────────────
+# Leaderboard & Trend
+# ──────────────────────────────────────────
+
+@app.get("/leaderboard")
+async def get_leaderboard(
+    age_group: str = Query("all"),
+    user_id: str = Depends(get_user_id),
+):
+    """
+    Simple leaderboard: top 20 users by best overall_score.
+    """
+    rows = await asyncio.to_thread(
+        d1_execute,
+        """SELECT a.user_id, MAX(a.overall_score) as score,
+                  COALESCE(p.display_name, '') as display_name
+           FROM analyses a
+           LEFT JOIN profiles p ON p.id = a.user_id
+           GROUP BY a.user_id
+           ORDER BY score DESC
+           LIMIT 20""",
+        [],
+    )
+
+    result = []
+    for i, r in enumerate(rows):
+        uid = r.get("user_id", "")
+        name = r.get("display_name", "") or "Player"
+        initials = name[:2].upper() if name else "??"
+        result.append({
+            "entry_id": f"lb_{i}",
+            "initials": initials,
+            "display_name": name,
+            "score": r.get("score", 0),
+            "is_me": uid == user_id,
+            "is_real_user": True,
+        })
+    return result
+
+
+@app.get("/trend")
+async def get_trend(
+    limit: int = Query(8, ge=1, le=50),
+    user_id: str = Depends(get_user_id),
+):
+    """Get score trend for the authenticated user."""
+    rows = await asyncio.to_thread(
+        d1_execute,
+        """SELECT overall_score, created_at
+           FROM analyses
+           WHERE user_id = ?1
+           ORDER BY created_at DESC
+           LIMIT ?2""",
+        [user_id, limit],
+    )
+    rows = list(reversed(rows))  # oldest first
+    result = []
+    for i, r in enumerate(rows):
+        result.append({
+            "session_number": i + 1,
+            "overall_score": r.get("overall_score", 0),
+            "created_at": r.get("created_at", ""),
+        })
+    return result
+
+
+@app.get("/best-score")
+async def get_best_score(user_id: str = Depends(get_user_id)):
+    rows = await asyncio.to_thread(
+        d1_execute,
+        """SELECT MAX(overall_score) as best_score
+           FROM analyses WHERE user_id = ?1""",
+        [user_id],
+    )
+    best = rows[0].get("best_score") if rows else None
+    return {"best_score": best}
+
+
+# ──────────────────────────────────────────
+# Account deletion
+# ──────────────────────────────────────────
+
+@app.delete("/account")
+async def delete_account(user_id: str = Depends(get_user_id)):
+    """Delete all user data."""
+    await asyncio.to_thread(d1_execute, "DELETE FROM analyses WHERE user_id = ?1", [user_id])
+    await asyncio.to_thread(d1_execute, "DELETE FROM children WHERE parent_id = ?1", [user_id])
+    await asyncio.to_thread(d1_execute, "DELETE FROM profiles WHERE id = ?1", [user_id])
+    await asyncio.to_thread(d1_execute, "DELETE FROM users WHERE id = ?1", [user_id])
+    return {"ok": True}
+
+
+# ──────────────────────────────────────────
+# Video Analysis
+# ──────────────────────────────────────────
 
 @app.post(
     "/analyze",
@@ -154,7 +456,7 @@ async def analyze(
             # 9. Upload video to cloud storage BEFORE cleanup
             video_url = await asyncio.to_thread(upload_to_storage, video_id, video_path, user_id)
             if video_url:
-                logger.info("[%s] Video uploaded to storage: %s", video_id[:8], video_url[:80])
+                logger.info("[%s] Video uploaded to R2: %s", video_id[:8], video_url[:80])
 
             # 10. Build before/after comparison object (if we had a previous session)
             previous_session = None
@@ -182,7 +484,7 @@ async def analyze(
                 video_url=video_url,
             )
 
-            # 12. Persist to Supabase (graceful failure — won't crash if DB not set up)
+            # 12. Persist to D1 (graceful failure — won't crash if DB not set up)
             await asyncio.to_thread(save_session, user_id, result)
 
             # 13. Fetch growth history AFTER saving so the current session is included

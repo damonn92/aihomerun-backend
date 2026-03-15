@@ -115,40 +115,54 @@ def get_video_info(video_path: Path) -> dict:
 
 def upload_to_storage(video_id: str, video_path: Path, user_id: str) -> "str | None":
     """
-    Upload video to Supabase Storage and return a public URL.
-    Returns None if upload fails or Supabase is not configured.
+    Upload video to Cloudflare R2 via S3-compatible API and return a public URL.
+    Returns None if upload fails or R2 is not configured.
     """
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    if not url or not key:
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    access_key = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    endpoint = os.environ.get("R2_ENDPOINT", "").strip()
+    public_url = os.environ.get("R2_PUBLIC_URL", "").strip()
+
+    if not access_key or not secret_key or not endpoint:
         return None
 
     try:
-        from supabase import create_client
-        client = create_client(url, key)
-        bucket = "videos"
+        import boto3
+        from botocore.config import Config
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=Config(signature_version="s3v4"),
+            region_name="auto",
+        )
+
+        bucket = "aihomerun-videos"
         ext = video_path.suffix  # e.g. ".mov"
-        storage_path = f"{user_id}/{video_id}{ext}"
+        storage_key = f"{user_id}/{video_id}{ext}"
 
-        with open(video_path, "rb") as f:
-            data = f.read()
-
-        # Determine content type
         content_types = {".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v"}
         content_type = content_types.get(ext.lower(), "video/mp4")
 
-        client.storage.from_(bucket).upload(
-            path=storage_path,
-            file=data,
-            file_options={"content-type": content_type},
+        s3.upload_file(
+            str(video_path),
+            bucket,
+            storage_key,
+            ExtraArgs={"ContentType": content_type},
         )
 
-        # Get public URL
-        res = client.storage.from_(bucket).get_public_url(storage_path)
-        return res
+        # Build public URL
+        if public_url:
+            return f"{public_url.rstrip('/')}/{storage_key}"
+        return f"{endpoint}/{bucket}/{storage_key}"
+
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("upload_to_storage failed: %s", exc)
+        _logger.warning("upload_to_storage (R2) failed: %s", exc)
         return None
 
 
