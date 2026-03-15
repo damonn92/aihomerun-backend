@@ -20,8 +20,12 @@ Required Supabase table (run once in your project's SQL editor):
     balance_metric          FLOAT,
     follow_through          BOOLEAN,
     plain_summary           TEXT,
-    video_id                TEXT
+    video_id                TEXT,
+    video_url               TEXT
   );
+
+  -- If upgrading an existing table, run:
+  -- ALTER TABLE analyses ADD COLUMN video_url TEXT;
 
   CREATE INDEX analyses_user_action
     ON analyses (user_id, action_type, created_at DESC);
@@ -29,21 +33,35 @@ Required Supabase table (run once in your project's SQL editor):
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional, List
 
+logger = logging.getLogger(__name__)
+
+# Singleton Supabase client — avoids re-creating on every request
+_supabase_client = None
+_supabase_init_attempted = False
+
 
 def _client():
-    """Return a Supabase admin client, or None if credentials are missing."""
+    """Return a cached Supabase admin client, or None if credentials are missing."""
+    global _supabase_client, _supabase_init_attempted
+    if _supabase_client is not None:
+        return _supabase_client
+    if _supabase_init_attempted:
+        return None
+    _supabase_init_attempted = True
     url = os.environ.get("SUPABASE_URL", "").strip()
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     if not url or not key:
         return None
     try:
         from supabase import create_client
-        return create_client(url, key)
+        _supabase_client = create_client(url, key)
+        return _supabase_client
     except Exception as exc:
-        print(f"⚠️  Supabase client init error: {exc}")
+        logger.warning("Supabase client init error: %s", exc)
         return None
 
 
@@ -71,11 +89,12 @@ def save_session(user_id: str, result) -> Optional[str]:
             "follow_through":           mt.follow_through,
             "plain_summary":            fb.plain_summary,
             "video_id":                 result.video_id,
+            "video_url":                getattr(result, "video_url", None),
         }
         res = client.table("analyses").insert(row).execute()
         return res.data[0]["id"] if res.data else None
     except Exception as exc:
-        print(f"⚠️  save_session failed: {exc}")
+        logger.warning("save_session failed: %s", exc)
         return None
 
 
@@ -91,7 +110,7 @@ def get_previous_session(user_id: str, action_type: str) -> Optional[dict]:
     try:
         res = (
             client.table("analyses")
-            .select("id, created_at, action_type, overall_score, technique_score, power_score, balance_score")
+            .select("id, created_at, action_type, overall_score, technique_score, power_score, balance_score, video_id, video_url")
             .eq("user_id", user_id)
             .eq("action_type", action_type)
             .order("created_at", desc=True)
@@ -100,7 +119,7 @@ def get_previous_session(user_id: str, action_type: str) -> Optional[dict]:
         )
         return res.data[0] if res.data else None
     except Exception as exc:
-        print(f"⚠️  get_previous_session failed: {exc}")
+        logger.warning("get_previous_session failed: %s", exc)
         return None
 
 
@@ -120,7 +139,7 @@ def get_history(
     try:
         query = (
             client.table("analyses")
-            .select("created_at, overall_score, technique_score, power_score, balance_score")
+            .select("created_at, overall_score, technique_score, power_score, balance_score, video_id, video_url")
             .eq("user_id", user_id)
         )
         if action_type:
@@ -134,5 +153,5 @@ def get_history(
         rows = res.data or []
         return list(reversed(rows))   # oldest → newest for chart x-axis
     except Exception as exc:
-        print(f"⚠️  get_history failed: {exc}")
+        logger.warning("get_history failed: %s", exc)
         return []

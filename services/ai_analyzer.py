@@ -1,17 +1,29 @@
 """
 AI analysis module: sends motion metrics to Claude and generates coaching feedback.
 """
+from __future__ import annotations
+
 import json
+import logging
 import os
+import re
 import anthropic
 from models.schemas import MotionMetrics, AIFeedback, DrillInfo
 
+logger = logging.getLogger(__name__)
 
-def _get_client():
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
-    return anthropic.Anthropic(api_key=key)
+# Singleton client — reuses connection pool and honours max_retries
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
+        _anthropic_client = anthropic.Anthropic(api_key=key, max_retries=3)
+    return _anthropic_client
 
 
 SYSTEM_PROMPT = """You are an expert youth baseball coach with 10+ years of experience training players aged 6-18.
@@ -67,6 +79,13 @@ def build_metrics_description(metrics: MotionMetrics, age: int) -> str:
         f"- Front knee bend: {a.knee_bend:.1f}°  (ideal 130–160°; too straight or too bent both reduce power)",
         f"- Spine/stride index: {a.spine_tilt:.1f}",
     ]
+
+    # Bat plane metrics (swing only, when available)
+    if metrics.plane_efficiency is not None:
+        lines.append(f"- Bat plane efficiency: {metrics.plane_efficiency:.1f}%  (how much of the swing path stays on the ideal swing plane; >80% is excellent)")
+    if metrics.bat_path_consistency is not None:
+        lines.append(f"- Bat path consistency: {metrics.bat_path_consistency:.1f}%  (smoothness of the bat path; >75% is good, lower means jerky swing)")
+
     return "\n".join(lines)
 
 
@@ -121,16 +140,24 @@ def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
 
     raw = response.content[0].text.strip()
 
-    # Defensive JSON extraction in case model wraps in code fences
+    # Robust JSON extraction — try code fences first, then regex for outermost {}
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
+    else:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
 
     data = json.loads(raw)
 
+    # Clamp all scores to 0-100 range
+    for key in ("overall_score", "technique_score", "power_score", "balance_score"):
+        data[key] = max(0, min(100, int(data.get(key, 50))))
+
     # Build DrillInfo — handle both object (new) and plain string (legacy)
-    raw_drill = data["drill"]
+    raw_drill = data.get("drill", {})
     if isinstance(raw_drill, dict):
         drill_obj = DrillInfo(
             name=raw_drill.get("name", "Practice Drill"),

@@ -27,11 +27,15 @@ class PoseAnalyzer:
         对每一帧做姿态分析
         返回: list of landmark dicts，检测失败的帧为 None
         """
+        import cv2
         results = []
         for frame in frames:
-            import cv2
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = self.pose.process(rgb)
+            try:
+                result = self.pose.process(rgb)
+            except Exception:
+                results.append(None)
+                continue
             if result.pose_landmarks:
                 results.append(self._landmarks_to_dict(result.pose_landmarks, frame.shape))
             else:

@@ -101,6 +101,9 @@ def analyze_swing(frames_data: list[dict | None]) -> MotionMetrics:
     # 8. 随挥检测：后挥手腕是否超过身体中线
     follow_through = _check_follow_through(good, is_right_batter)
 
+    # 9. 球棒平面效率 & 路径一致性（从手腕轨迹估算）
+    plane_eff, bat_consistency = _calculate_plane_metrics(good, wrist_speeds, peak_idx, is_right_batter)
+
     return MotionMetrics(
         action_type="swing",
         frames_analyzed=len(good),
@@ -115,6 +118,8 @@ def analyze_swing(frames_data: list[dict | None]) -> MotionMetrics:
             knee_bend=round(knee_bend, 1),
             spine_tilt=round(spine_tilt, 1),
         ),
+        plane_efficiency=plane_eff,
+        bat_path_consistency=bat_consistency,
     )
 
 
@@ -226,6 +231,75 @@ def _estimate_height(frame: dict) -> float:
         return 200.0  # 默认值
     ankle_y = (frame[LA][1] + frame[RA][1]) / 2
     return abs(ankle_y - frame[NOSE][1])
+
+
+def _calculate_plane_metrics(
+    frames: list[dict],
+    wrist_speeds: list[float],
+    peak_idx: int,
+    is_right_batter: bool,
+) -> tuple[float | None, float | None]:
+    """
+    Estimate bat plane efficiency and bat path consistency from 2D wrist trajectory.
+
+    Plane efficiency: What percentage of the wrist path during the swing zone
+    stays on the ideal swing plane.  We approximate the "ideal plane" as the
+    best-fit line through the wrist positions during the active swing phase,
+    then measure how tightly the actual path hugs that line (R² value → 0-100%).
+
+    Bat path consistency: How smooth / jitter-free the wrist velocity profile
+    is during the swing.  Computed as 1 − normalised jerk (rate of speed change).
+
+    Returns (plane_efficiency, bat_path_consistency) each 0-100 or None.
+    """
+    wrist_key = RW if is_right_batter else LW
+
+    # Define the "swing zone" — frames around peak wrist speed (±40% of total frames, at least 3)
+    half_window = max(2, len(frames) // 5)
+    start = max(0, peak_idx - half_window)
+    end = min(len(frames), peak_idx + half_window + 1)
+    swing_frames = frames[start:end]
+
+    if len(swing_frames) < 3:
+        return None, None
+
+    # Extract wrist (x, y) during swing zone
+    xs = np.array([f[wrist_key][0] for f in swing_frames])
+    ys = np.array([f[wrist_key][1] for f in swing_frames])
+
+    # ── Plane efficiency (line-fit R²) ──
+    # Fit a line to the wrist path: y = mx + b
+    # R² tells us how much of the variance is explained by a straight path
+    try:
+        coeffs = np.polyfit(xs, ys, 1)
+        y_pred = np.polyval(coeffs, xs)
+        ss_res = np.sum((ys - y_pred) ** 2)
+        ss_tot = np.sum((ys - np.mean(ys)) ** 2)
+        if ss_tot > 0:
+            r_squared = 1.0 - ss_res / ss_tot
+        else:
+            r_squared = 1.0  # Perfectly flat — all same y, perfect plane
+        # R² can be negative for very bad fits; clamp to [0, 1]
+        plane_efficiency = round(max(0.0, min(1.0, r_squared)) * 100.0, 1)
+    except (np.linalg.LinAlgError, ValueError):
+        plane_efficiency = None
+
+    # ── Bat path consistency (velocity smoothness) ──
+    # Calculate frame-to-frame speed changes (jerk proxy)
+    swing_speeds = wrist_speeds[start:end]
+    if len(swing_speeds) >= 3:
+        speed_arr = np.array(swing_speeds, dtype=float)
+        # Jerk = second derivative of position ≈ first derivative of speed
+        speed_diffs = np.diff(speed_arr)
+        # Normalise jerk by mean speed to get a dimensionless roughness metric
+        mean_speed = np.mean(speed_arr) if np.mean(speed_arr) > 0 else 1.0
+        normalised_jerk = np.std(speed_diffs) / mean_speed
+        # Map to 0-100: jerk=0 → 100% consistent, jerk≥1.5 → ~0%
+        bat_consistency = round(max(0.0, min(1.0, 1.0 - normalised_jerk / 1.5)) * 100.0, 1)
+    else:
+        bat_consistency = None
+
+    return plane_efficiency, bat_consistency
 
 
 def _check_follow_through(frames: list[dict], is_right: bool) -> bool:

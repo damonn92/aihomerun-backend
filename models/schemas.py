@@ -1,6 +1,6 @@
 from __future__ import annotations
-from pydantic import BaseModel
-from typing import Optional, List
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
 
 
 class JointAngles(BaseModel):
@@ -12,13 +12,15 @@ class JointAngles(BaseModel):
 
 
 class MotionMetrics(BaseModel):
-    action_type: str                        # "swing" 或 "pitch"
+    action_type: Literal["swing", "pitch"]  # "swing" 或 "pitch"
     frames_analyzed: int                    # 分析帧数
     peak_wrist_speed: float                 # 手腕峰值速度（像素/帧）
     hip_shoulder_separation: float          # 髋肩分离角度
     balance_score: float                    # 重心平衡分（0-1）
     joint_angles: JointAngles
     follow_through: bool                    # 是否有充分随挥
+    plane_efficiency: Optional[float] = None      # 球棒在挥棒平面上的时间占比 (0-100%)
+    bat_path_consistency: Optional[float] = None  # 球棒路径一致性 (0-100%)
 
 
 class DrillInfo(BaseModel):
@@ -28,10 +30,10 @@ class DrillInfo(BaseModel):
 
 
 class AIFeedback(BaseModel):
-    overall_score: int                      # 总评分 0-100
-    technique_score: int                    # 技术分
-    power_score: int                        # 力量分
-    balance_score: int                      # 平衡分
+    overall_score: int = Field(ge=0, le=100)       # 总评分 0-100
+    technique_score: int = Field(ge=0, le=100)     # 技术分
+    power_score: int = Field(ge=0, le=100)         # 力量分
+    balance_score: int = Field(ge=0, le=100)       # 平衡分
     strengths: List[str]                    # 优点列表（3条）
     improvements: List[str]                 # 改进建议（2条）
     drill: DrillInfo                        # 1个针对核心问题的练习（结构化）
@@ -45,7 +47,7 @@ class AIFeedback(BaseModel):
 class QualityIssue(BaseModel):
     check: str               # Machine-readable check name, e.g. "low_fps"
     message: str             # Human-readable explanation
-    severity: str            # "warning" | "error"
+    severity: Literal["warning", "error"]
 
 
 class QualityGateResult(BaseModel):
@@ -64,12 +66,16 @@ class PreviousSession(BaseModel):
     technique_score: int
     power_score: int
     balance_score: int
+    video_id: Optional[str] = None
+    video_url: Optional[str] = None
 
 
 class HistorySummary(BaseModel):
     """Lightweight row for the growth sparkline chart."""
     session_date: str
     overall_score: int
+    video_id: Optional[str] = None
+    video_url: Optional[str] = None
 
 
 # ── API Response ──────────────────────────────────────────────────────────────
@@ -83,6 +89,7 @@ class AnalysisResult(BaseModel):
     quality: Optional[QualityGateResult] = None
     previous_session: Optional[PreviousSession] = None
     history: Optional[List[HistorySummary]] = None
+    video_url: Optional[str] = None
 
 
 class AnalysisError(BaseModel):

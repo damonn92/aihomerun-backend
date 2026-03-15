@@ -2,6 +2,8 @@
 BaseAI — Youth Baseball AI Coaching Backend
 FastAPI entry point
 """
+import asyncio
+import logging
 import time
 import os
 from contextlib import asynccontextmanager
@@ -14,7 +16,12 @@ from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from services.video_processor import save_upload, extract_frames, get_video_info, cleanup_video_dir
+logger = logging.getLogger(__name__)
+
+# Limit concurrent video analyses to prevent OOM on small instances
+_analysis_semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_ANALYSES", 3)))
+
+from services.video_processor import save_upload, extract_frames, get_video_info, cleanup_video_dir, upload_to_storage
 from services.pose_analyzer import PoseAnalyzer
 from services.baseball_metrics import analyze_swing, analyze_pitch
 from services.ai_analyzer import analyze_with_claude
@@ -42,10 +49,12 @@ async def lifespan(app: FastAPI):
     print("🔴 PoseAnalyzer shut down")
 
 
+APP_VERSION = "0.2.0"
+
 app = FastAPI(
     title="BaseAI API",
     description="AI-powered youth baseball coaching — upload a swing or pitch video and get instant feedback.",
-    version="0.2.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -69,7 +78,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "BaseAI", "version": "0.2.0", "model": "claude-haiku-4-5"}
+    return {"status": "ok", "app": "BaseAI", "version": APP_VERSION}
 
 
 @app.post(
@@ -89,111 +98,121 @@ async def analyze(
 
     start = time.time()
     video_id = None
-    print(f"👤 Authenticated user: {user_id[:8]}…")
+    logger.info("Authenticated user: %s…", user_id[:8])
 
-    try:
-        # 1. Save upload
-        video_id, video_path = await save_upload(file)
+    async with _analysis_semaphore:
+        try:
+            # 1. Save upload
+            video_id, video_path = await save_upload(file)
 
-        # 2. Video info (for logging + quality gate)
-        info = get_video_info(video_path)
-        print(f"📹 [{video_id[:8]}] {info['width']}x{info['height']} "
-              f"{info['fps']:.1f}fps {info['duration_sec']:.1f}s")
+            # 2. Video info (for logging + quality gate)
+            info = await asyncio.to_thread(get_video_info, video_path)
+            logger.info("[%s] %dx%d %.1ffps %.1fs",
+                        video_id[:8], info['width'], info['height'],
+                        info['fps'], info['duration_sec'])
 
-        # 3. Extract frames
-        frames = extract_frames(video_path)
-        print(f"🖼  [{video_id[:8]}] {len(frames)} frames extracted")
+            # 3. Extract frames
+            frames = await asyncio.to_thread(extract_frames, video_path)
+            logger.info("[%s] %d frames extracted", video_id[:8], len(frames))
 
-        # 4. MediaPipe pose estimation
-        frames_data = pose_analyzer.analyze_frames(frames)
-        valid_count = sum(1 for f in frames_data if f is not None)
-        print(f"🦾 [{video_id[:8]}] Valid pose frames: {valid_count}/{len(frames)}")
+            # 4. MediaPipe pose estimation
+            frames_data = await asyncio.to_thread(pose_analyzer.analyze_frames, frames)
+            valid_count = sum(1 for f in frames_data if f is not None)
+            logger.info("[%s] Valid pose frames: %d/%d", video_id[:8], valid_count, len(frames))
 
-        # 5. Quality Gate — run before expensive analysis
-        quality = check_quality(frames, frames_data, info)
-        warn_count = sum(1 for i in quality.issues if i.severity == "warning")
-        err_count  = sum(1 for i in quality.issues if i.severity == "error")
-        print(f"🔍 [{video_id[:8]}] Quality: {'✅ passed' if quality.passed else '❌ failed'} "
-              f"(visibility {quality.visibility_rate:.0%}, {err_count} errors, {warn_count} warnings)")
+            # 5. Quality Gate — run before expensive analysis
+            quality = await asyncio.to_thread(check_quality, frames, frames_data, info)
+            logger.info("[%s] Quality: %s (visibility %.0f%%)",
+                        video_id[:8], "passed" if quality.passed else "failed",
+                        quality.visibility_rate * 100)
 
-        if not quality.passed:
-            # Return structured error so the frontend can display per-check messages
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "video_quality_check_failed",
-                    "issues": [i.model_dump() for i in quality.issues],
-                    "visibility_rate": quality.visibility_rate,
-                },
-            )
-
-        # 6. Fetch previous session BEFORE saving (for before/after comparison)
-        prev_row = get_previous_session(user_id, action_type)
-
-        # 7. Compute baseball-specific metrics
-        if action_type == "swing":
-            metrics = analyze_swing(frames_data)
-        else:
-            metrics = analyze_pitch(frames_data)
-
-        # 8. Claude AI feedback
-        feedback = analyze_with_claude(metrics, age=age)
-
-        elapsed = round(time.time() - start, 2)
-        print(f"✅ [{video_id[:8]}] Done — score {feedback.overall_score}, {elapsed}s")
-
-        # 9. Build before/after comparison object (if we had a previous session)
-        previous_session = None
-        if prev_row:
-            previous_session = PreviousSession(
-                session_date=prev_row["created_at"],
-                action_type=prev_row["action_type"],
-                overall_score=prev_row["overall_score"],
-                technique_score=prev_row["technique_score"],
-                power_score=prev_row["power_score"],
-                balance_score=prev_row["balance_score"],
-            )
-
-        # 10. Assemble result
-        result = AnalysisResult(
-            video_id=video_id,
-            action_type=action_type,
-            metrics=metrics,
-            feedback=feedback,
-            processing_time_seconds=elapsed,
-            quality=quality,
-            previous_session=previous_session,
-        )
-
-        # 11. Persist to Supabase (graceful failure — won't crash if DB not set up)
-        save_session(user_id, result)
-
-        # 12. Fetch growth history AFTER saving so the current session is included
-        hist_rows = get_history(user_id, action_type, limit=8)
-        if hist_rows:
-            result.history = [
-                HistorySummary(
-                    session_date=r["created_at"],
-                    overall_score=r["overall_score"],
+            if not quality.passed:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "video_quality_check_failed",
+                        "issues": [i.model_dump() for i in quality.issues],
+                        "visibility_rate": quality.visibility_rate,
+                    },
                 )
-                for r in hist_rows
-            ]
 
-        return result
+            # 6. Fetch previous session BEFORE saving (for before/after comparison)
+            prev_row = await asyncio.to_thread(get_previous_session, user_id, action_type)
 
-    except HTTPException:
-        raise
+            # 7. Compute baseball-specific metrics
+            if action_type == "swing":
+                metrics = await asyncio.to_thread(analyze_swing, frames_data)
+            else:
+                metrics = await asyncio.to_thread(analyze_pitch, frames_data)
 
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+            # 8. Claude AI feedback
+            feedback = await asyncio.to_thread(analyze_with_claude, metrics, age)
 
-    except Exception as e:
-        print(f"❌ [{video_id[:8] if video_id else '?'}] Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+            elapsed = round(time.time() - start, 2)
+            logger.info("[%s] Done — score %d, %.2fs", video_id[:8], feedback.overall_score, elapsed)
 
-    finally:
-        if video_id:
-            cleanup_video_dir(video_id)
+            # 9. Upload video to cloud storage BEFORE cleanup
+            video_url = await asyncio.to_thread(upload_to_storage, video_id, video_path, user_id)
+            if video_url:
+                logger.info("[%s] Video uploaded to storage: %s", video_id[:8], video_url[:80])
+
+            # 10. Build before/after comparison object (if we had a previous session)
+            previous_session = None
+            if prev_row:
+                previous_session = PreviousSession(
+                    session_date=prev_row["created_at"],
+                    action_type=prev_row["action_type"],
+                    overall_score=prev_row["overall_score"],
+                    technique_score=prev_row["technique_score"],
+                    power_score=prev_row["power_score"],
+                    balance_score=prev_row["balance_score"],
+                    video_id=prev_row.get("video_id"),
+                    video_url=prev_row.get("video_url"),
+                )
+
+            # 11. Assemble result
+            result = AnalysisResult(
+                video_id=video_id,
+                action_type=action_type,
+                metrics=metrics,
+                feedback=feedback,
+                processing_time_seconds=elapsed,
+                quality=quality,
+                previous_session=previous_session,
+                video_url=video_url,
+            )
+
+            # 12. Persist to Supabase (graceful failure — won't crash if DB not set up)
+            await asyncio.to_thread(save_session, user_id, result)
+
+            # 13. Fetch growth history AFTER saving so the current session is included
+            hist_rows = await asyncio.to_thread(get_history, user_id, action_type, 8)
+            if hist_rows:
+                result.history = [
+                    HistorySummary(
+                        session_date=r["created_at"],
+                        overall_score=r["overall_score"],
+                        video_id=r.get("video_id"),
+                        video_url=r.get("video_url"),
+                    )
+                    for r in hist_rows
+                ]
+
+            return result
+
+        except HTTPException:
+            raise
+
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        except Exception as e:
+            logger.exception("[%s] Analysis error", video_id[:8] if video_id else "?")
+            raise HTTPException(status_code=500, detail="Analysis failed. Please try again.")
+
+        finally:
+            if video_id:
+                cleanup_video_dir(video_id)
 
 
 @app.get(

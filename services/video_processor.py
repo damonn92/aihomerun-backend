@@ -37,7 +37,6 @@ async def save_upload(file: UploadFile) -> tuple:
         while chunk := await file.read(1024 * 1024):  # 1 MB chunks
             size += len(chunk)
             if size > MAX_VIDEO_SIZE_MB * 1024 * 1024:
-                await out.close()
                 shutil.rmtree(video_dir)
                 raise HTTPException(
                     status_code=413,
@@ -69,23 +68,25 @@ def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> lis
     frame_interval = max(1, int(video_fps / target_fps))
 
     frames = []
-    frame_idx = 0
+    current_frame = 0
+    next_target = 0
     max_frame = int(max_duration * video_fps)
 
-    while frame_idx < max_frame:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    while next_target < max_frame:
         ret, frame = cap.read()
         if not ret:
             break
-        # Downscale wide frames to MAX_FRAME_WIDTH — reduces memory 85% for 1080p
-        h, w = frame.shape[:2]
-        if w > MAX_FRAME_WIDTH:
-            scale = MAX_FRAME_WIDTH / w
-            new_w = MAX_FRAME_WIDTH
-            new_h = int(h * scale)
-            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        frames.append(frame)
-        frame_idx += frame_interval
+        if current_frame == next_target:
+            # Downscale wide frames to MAX_FRAME_WIDTH — reduces memory 85% for 1080p
+            h, w = frame.shape[:2]
+            if w > MAX_FRAME_WIDTH:
+                scale = MAX_FRAME_WIDTH / w
+                new_w = MAX_FRAME_WIDTH
+                new_h = int(h * scale)
+                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+            next_target += frame_interval
+        current_frame += 1
 
     cap.release()
 
@@ -110,6 +111,45 @@ def get_video_info(video_path: Path) -> dict:
     }
     cap.release()
     return info
+
+
+def upload_to_storage(video_id: str, video_path: Path, user_id: str) -> "str | None":
+    """
+    Upload video to Supabase Storage and return a public URL.
+    Returns None if upload fails or Supabase is not configured.
+    """
+    url = os.environ.get("SUPABASE_URL", "").strip()
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        return None
+
+    try:
+        from supabase import create_client
+        client = create_client(url, key)
+        bucket = "videos"
+        ext = video_path.suffix  # e.g. ".mov"
+        storage_path = f"{user_id}/{video_id}{ext}"
+
+        with open(video_path, "rb") as f:
+            data = f.read()
+
+        # Determine content type
+        content_types = {".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v"}
+        content_type = content_types.get(ext.lower(), "video/mp4")
+
+        client.storage.from_(bucket).upload(
+            path=storage_path,
+            file=data,
+            file_options={"content-type": content_type},
+        )
+
+        # Get public URL
+        res = client.storage.from_(bucket).get_public_url(storage_path)
+        return res
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("upload_to_storage failed: %s", exc)
+        return None
 
 
 def cleanup_video_dir(video_id: str):

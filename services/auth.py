@@ -97,16 +97,23 @@ def get_current_user(
     try:
         header = jwt.get_unverified_header(token)
         kid = header.get("kid")
-        alg = header.get("alg", "")
 
-        if kid and alg in ("ES256", "RS256"):
+        if kid:
             pub_key = _get_public_key(kid)
             if pub_key:
+                # Determine algorithm from JWK kty, NOT from untrusted token header
+                jwks = _get_jwks()
+                alg = "ES256"  # default
+                for key_data in jwks.get("keys", []):
+                    if key_data.get("kid") == kid:
+                        kty = key_data.get("kty", "")
+                        alg = "RS256" if kty == "RSA" else "ES256"
+                        break
                 payload = jwt.decode(
                     token,
                     pub_key,
                     algorithms=[alg],
-                    options={"verify_aud": False},
+                    audience="authenticated",
                 )
                 return payload
 
@@ -115,7 +122,7 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session expired. Please sign in again.",
         )
-    except Exception:
+    except jwt.InvalidTokenError:
         pass  # fall through to HS256
 
     # ── Fallback: HS256 legacy secret ─────────────────────────────────────────
@@ -126,7 +133,7 @@ def get_current_user(
                 token,
                 secret,
                 algorithms=["HS256"],
-                options={"verify_aud": False},
+                audience="authenticated",
             )
             return payload
         except jwt.ExpiredSignatureError:
@@ -134,10 +141,10 @@ def get_current_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session expired. Please sign in again.",
             )
-        except jwt.InvalidTokenError as e:
+        except jwt.InvalidTokenError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid token: {e}",
+                detail="Invalid token. Please sign in again.",
             )
 
     raise HTTPException(

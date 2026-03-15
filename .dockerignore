@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 uploads/
 __pycache__/
 *.pyc
@@ -6,3 +8,4 @@ __pycache__/
 .git
 tests/
 *.md
+.vscode/
