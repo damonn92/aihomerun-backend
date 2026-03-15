@@ -16,6 +16,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download MediaPipe model files so they don't need to be fetched at runtime.
+# Also grant write access to the mediapipe modules dir for the non-root user.
+RUN python -c "import mediapipe as mp; mp.solutions.pose.Pose()" 2>/dev/null || true
+RUN chmod -R a+rw /usr/local/lib/python3.11/site-packages/mediapipe/modules/ 2>/dev/null || true
+
 # Copy source
 COPY . .
 
