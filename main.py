@@ -223,8 +223,7 @@ from fastapi.responses import JSONResponse
 
 @app.post(
     "/analyze",
-    status_code=202,
-    summary="Upload a baseball video for async AI coaching analysis",
+    summary="Upload a baseball video for AI coaching analysis",
 )
 async def analyze(
     file: UploadFile = File(..., description="Baseball video file (mp4/mov/avi, max 100 MB)"),
@@ -239,35 +238,154 @@ async def analyze(
     if redis_is_configured() and not check_rate_limit(user_id, "analyze", limit=10, window_seconds=3600):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
 
+    # Choose async (Redis + worker) or synchronous (direct) processing
+    use_async = redis_is_configured()
+
     video_id = None
     try:
         # 1. Save upload to temp
         video_id, video_path = await save_upload(file)
 
-        # 2. Upload raw video to R2 immediately
+        # 2. Upload raw video to R2
         video_url = await asyncio.to_thread(upload_to_storage, video_id, video_path, user_id)
-        if not video_url:
-            raise HTTPException(status_code=500, detail="Failed to upload video. Please try again.")
 
-        # Build storage key (same format as upload_to_storage uses)
-        ext = video_path.suffix
-        storage_key = f"{user_id}/{video_id}{ext}"
+        if use_async:
+            # ── Async path: create job + return 202 ──
+            if not video_url:
+                raise HTTPException(status_code=500, detail="Failed to upload video. Please try again.")
 
-        # 3. Create async job
-        job_id = await asyncio.to_thread(
-            create_job, user_id, action_type, age, storage_key
-        )
+            ext = video_path.suffix
+            storage_key = f"{user_id}/{video_id}{ext}"
 
-        return {"job_id": job_id, "status": "pending"}
+            job_id = await asyncio.to_thread(
+                create_job, user_id, action_type, age, storage_key
+            )
+
+            return JSONResponse(
+                status_code=202,
+                content={"job_id": job_id, "status": "pending"},
+            )
+        else:
+            # ── Synchronous path: process video directly ──
+            return await _analyze_sync(
+                video_id=video_id,
+                video_path=video_path,
+                video_url=video_url,
+                action_type=action_type,
+                age=age,
+                user_id=user_id,
+            )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Failed to create analysis job")
+        logger.exception("Failed to process analysis")
         raise HTTPException(status_code=500, detail="Failed to start analysis. Please try again.")
     finally:
         if video_id:
             cleanup_video_dir(video_id)
+
+
+async def _analyze_sync(
+    video_id: str,
+    video_path,
+    video_url: str | None,
+    action_type: str,
+    age: int,
+    user_id: str,
+) -> AnalysisResult:
+    """
+    Synchronous analysis fallback — runs the full pipeline in-process.
+    Used when Redis/worker infrastructure is not available.
+    """
+    import time as _time
+
+    start = _time.time()
+
+    async with _analysis_semaphore:
+        # 1. Video info
+        info = await asyncio.to_thread(get_video_info, video_path)
+        logger.info("Video: %dx%d %.1ffps %.1fs",
+                     info["width"], info["height"], info["fps"], info["duration_sec"])
+
+        # 2. Extract frames
+        frames = await asyncio.to_thread(extract_frames, video_path)
+        logger.info("Extracted %d frames", len(frames))
+
+        # 3. MediaPipe pose estimation
+        frames_data = await asyncio.to_thread(pose_analyzer.analyze_frames, frames)
+        valid_count = sum(1 for f in frames_data if f is not None)
+        logger.info("Valid pose frames: %d/%d", valid_count, len(frames))
+
+        # 4. Quality gate
+        quality = await asyncio.to_thread(check_quality, frames, frames_data, info)
+        if not quality.passed:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "quality_gate_failed",
+                    "issues": [i.model_dump() for i in quality.issues],
+                    "visibility_rate": quality.visibility_rate,
+                },
+            )
+
+        # 5. Previous session for comparison
+        prev_row = await asyncio.to_thread(get_previous_session, user_id, action_type)
+
+        # 6. Compute metrics
+        if action_type == "swing":
+            metrics = await asyncio.to_thread(analyze_swing, frames_data)
+        else:
+            metrics = await asyncio.to_thread(analyze_pitch, frames_data)
+
+        # 7. Claude AI feedback
+        feedback = await asyncio.to_thread(analyze_with_claude, metrics, age)
+
+        # 8. Build comparison
+        previous_session = None
+        if prev_row:
+            previous_session = PreviousSession(
+                session_date=prev_row["created_at"],
+                action_type=prev_row["action_type"],
+                overall_score=prev_row["overall_score"],
+                technique_score=prev_row["technique_score"],
+                power_score=prev_row["power_score"],
+                balance_score=prev_row["balance_score"],
+                video_id=prev_row.get("video_id"),
+                video_url=prev_row.get("video_url"),
+            )
+
+        # 9. Assemble result
+        elapsed = _time.time() - start
+        result = AnalysisResult(
+            video_id=video_id,
+            action_type=action_type,
+            metrics=metrics,
+            feedback=feedback,
+            processing_time_seconds=round(elapsed, 2),
+            quality=quality,
+            previous_session=previous_session,
+            video_url=video_url,
+        )
+
+        # 10. Save to database
+        await asyncio.to_thread(save_session, user_id, result)
+
+        # 11. Add history
+        hist_rows = await asyncio.to_thread(get_history, user_id, action_type, 8)
+        if hist_rows:
+            result.history = [
+                HistorySummary(
+                    session_date=r["created_at"],
+                    overall_score=r["overall_score"],
+                    video_id=r.get("video_id"),
+                    video_url=r.get("video_url"),
+                )
+                for r in hist_rows
+            ]
+
+        logger.info("Sync analysis complete — score %d (%.1fs)", feedback.overall_score, elapsed)
+        return result
 
 
 @app.get(
