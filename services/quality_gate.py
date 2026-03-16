@@ -13,7 +13,8 @@ Warnings are included in the result but do NOT block analysis.
 """
 import cv2
 import numpy as np
-from models.schemas import QualityGateResult, QualityIssue
+from models.schemas import QualityGateResult, QualityIssue, ViewingAngle
+from services.pose_analyzer import detect_viewing_angle
 
 
 def check_quality(
@@ -132,7 +133,9 @@ def check_quality(
             ))
 
     # ── 5. Frame count / action completeness ──────────────────────────────────
-    if total < 6:
+    # At 12 fps sampling, a 1-second clip = 12 frames; minimum ~0.8s = 10 frames
+    min_frames = 10
+    if total < min_frames:
         issues.append(QualityIssue(
             check="too_short",
             message=(
@@ -142,10 +145,29 @@ def check_quality(
             severity="error",
         ))
 
+    # ── 6. Viewing angle detection ────────────────────────────────────────────
+    angle_info = detect_viewing_angle(frames_data)
+    viewing_angle = ViewingAngle(**angle_info)
+
+    # Non-side angles get a warning (not error — still allow analysis)
+    if angle_info["angle"] in ("front", "back"):
+        issues.append(QualityIssue(
+            check="suboptimal_angle",
+            message=angle_info["recommendation"],
+            severity="warning",
+        ))
+    elif angle_info["angle"] == "diagonal":
+        issues.append(QualityIssue(
+            check="diagonal_angle",
+            message=angle_info["recommendation"],
+            severity="warning",
+        ))
+
     # ── Result ────────────────────────────────────────────────────────────────
     has_errors = any(i.severity == "error" for i in issues)
     return QualityGateResult(
         passed=not has_errors,
         issues=issues,
         visibility_rate=round(visibility_rate, 2),
+        viewing_angle=viewing_angle,
     )

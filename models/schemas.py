@@ -50,10 +50,19 @@ class QualityIssue(BaseModel):
     severity: Literal["warning", "error"]
 
 
+class ViewingAngle(BaseModel):
+    """拍摄视角检测结果"""
+    angle: str               # "side", "front", "back", "diagonal", "unknown"
+    confidence: float        # 0.0-1.0
+    shoulder_ratio: float    # 肩宽/身高比
+    recommendation: str      # 给用户的建议
+
+
 class QualityGateResult(BaseModel):
     passed: bool
     issues: List[QualityIssue]
     visibility_rate: float   # Fraction of frames where pose was detected
+    viewing_angle: Optional[ViewingAngle] = None  # 视角检测结果
 
 
 # ── History / Comparison ──────────────────────────────────────────────────────

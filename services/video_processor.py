@@ -15,7 +15,7 @@ from fastapi import UploadFile, HTTPException
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 100))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
-FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", 6))
+FRAMES_PER_SECOND = int(os.getenv("FRAMES_PER_SECOND", 12))
 
 
 async def save_upload(file: UploadFile) -> tuple:
@@ -90,7 +90,7 @@ def extract_frames(video_path: Path, target_fps: int = FRAMES_PER_SECOND) -> lis
 
     cap.release()
 
-    if len(frames) < 5:
+    if len(frames) < 10:
         raise ValueError(
             f"Video too short — only {len(frames)} frames extracted. "
             "Please upload a clip of at least 1 second."

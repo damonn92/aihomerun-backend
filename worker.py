@@ -128,8 +128,10 @@ def process_job(job: dict) -> None:
             metrics = analyze_pitch(frames_data)
         update_job(job_id, progress=65)
 
-        # 8. Claude AI feedback
-        feedback = analyze_with_claude(metrics, age)
+        # 8. Claude AI feedback (include viewing angle context)
+        va = quality.viewing_angle
+        viewing_angle_dict = va.model_dump() if va else None
+        feedback = analyze_with_claude(metrics, age, viewing_angle=viewing_angle_dict)
         update_job(job_id, progress=80)
 
         # 9. Build video URL from storage key
@@ -204,8 +206,8 @@ def main():
     global pose_analyzer
 
     logger.info("Starting analysis worker...")
-    pose_analyzer = PoseAnalyzer()
-    logger.info("MediaPipe PoseAnalyzer initialized")
+    pose_analyzer = PoseAnalyzer(model_complexity=2, multi_pass=3)
+    logger.info("MediaPipe PoseAnalyzer initialized (complexity=2, multi_pass=3)")
 
     consecutive_errors = 0
 

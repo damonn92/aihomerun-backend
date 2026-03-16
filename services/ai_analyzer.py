@@ -58,11 +58,14 @@ Output rules — follow every rule exactly:
 8. "parent_tip": write ONE practical sentence for the parent describing what the player
    should practice today — keep the time under 10 minutes and make it sound easy and fun.
 
+If camera angle is NOT "side", note in plain_summary that a side-view recording
+would give more accurate results, but still provide the best analysis you can.
+
 ALL output must be in English.
 Output must be strict JSON only — no markdown, no extra text outside the JSON object."""
 
 
-def build_metrics_description(metrics: MotionMetrics, age: int) -> str:
+def build_metrics_description(metrics: MotionMetrics, age: int, viewing_angle: dict | None = None) -> str:
     """Convert metrics into a natural-language description for Claude."""
     action = "batting swing" if metrics.action_type == "swing" else "pitching"
     a = metrics.joint_angles
@@ -71,6 +74,17 @@ def build_metrics_description(metrics: MotionMetrics, age: int) -> str:
         f"Action type: {action}",
         f"Player age: {age} years old",
         f"Frames analyzed: {metrics.frames_analyzed}",
+    ]
+
+    # 视角信息 — 帮助 Claude 理解数据可靠度
+    if viewing_angle:
+        angle_name = viewing_angle.get("angle", "unknown")
+        angle_conf = viewing_angle.get("confidence", 0)
+        lines.append(f"Camera angle: {angle_name} view (confidence: {angle_conf:.0%})")
+        if angle_name not in ("side",):
+            lines.append("NOTE: Non-side camera angle — joint angle measurements may be less precise.")
+
+    lines += [
         "",
         "[Motion Data]",
         f"- Peak wrist speed: {metrics.peak_wrist_speed:.1f} px/frame  (reference: >15 is good for youth players)",
@@ -174,14 +188,14 @@ def _try_cache_set(cache_key: str, value, ttl: int = 86400):
         pass
 
 
-def analyze_with_claude(metrics: MotionMetrics, age: int = 10) -> AIFeedback:
+def analyze_with_claude(metrics: MotionMetrics, age: int = 10, viewing_angle: dict | None = None) -> AIFeedback:
     """
     Call Claude API to analyze motion metrics and generate coaching feedback.
     Falls back to heuristic scoring if Claude is unavailable.
     Results are cached in Redis for 24 hours.
     """
     action = "batting swing" if metrics.action_type == "swing" else "pitching"
-    metrics_desc = build_metrics_description(metrics, age)
+    metrics_desc = build_metrics_description(metrics, age, viewing_angle)
 
     # Check cache
     try:
